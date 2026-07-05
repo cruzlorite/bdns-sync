@@ -5,7 +5,9 @@
 
 [🇪🇸 Spanish version](./README.md)
 
-Sync engine that keeps a versioned (SCD2) copy of the [BDNS REST API](https://www.infosubvenciones.es/bdnstrans/api) in the database of your choice. Together with [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) (extraction) they're the same BDNS project: `bdns-fetch` talks to the API, `bdns-sync` versions what it brings back.
+Sync engine that keeps a versioned (SCD2) copy of the [BDNS REST API](https://www.infosubvenciones.es/bdnstrans/api) in the database of your choice.
+
+Sibling project: [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) talks to the API; `bdns-sync` versions what it brings back.
 
 A pure tool: one endpoint per invocation, no config file. Cadence lives in [`scripts/cron_dispatch.sh`](scripts/cron_dispatch.sh).
 
@@ -86,32 +88,6 @@ Per the official ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.e
 - No periodic removal-detection for the big search endpoints.
 - Individual records can come back malformed (confirmed live); skipped with a log instead of breaking the batch.
 - No historical backfill for `convocatorias` (each record is a real API call).
-
-## Testing
-
-Beyond the per-module unit tests (`tests/test_scd2.py`, `tests/test_generic.py`, `tests/test_hashing.py`...), there's a **multi-day scenario suite** (`tests/test_timeline_*.py`) that simulates, for **all 22 registered entities** (17 `full` + 4 `search` + `convocatorias`), the real sequence of cron runs over time: initial load, no-op resyncs, corrections, deletions, and new arrivals.
-
-### Data: real, not invented
-
-The fixtures (`tests/fixtures/*.json`) are real captures from the live API, with names, NIF/CIF, and identifiers replaced by fake values (anonymized wherever it could re-identify a beneficiary -- calls, catalogs, and public org charts are left as-is, they aren't personal data). Field shape is exactly the real one.
-
-### How the API is substituted: `FakeBDNSClient`
-
-`bdns.sync.syncers` never imports or type-checks against `BDNSClient` -- every `sync_*` function just calls `fetch_*` methods on whatever `client` object it's given. That makes any plain Python object exposing those same methods a complete substitute -- no mocking library needed. `tests/fake_client.py` defines `FakeBDNSClient`, loaded from the anonymized fixtures and mutable between simulated "days" (`client.sectores[0]["descripcion"] = "..."`, `client.concesiones_busqueda.pop()`, ...) to script each scenario.
-
-For incremental entities, every fixture record carries a `reg_days_ago` (days before yesterday, not an absolute date -- so the fixture never goes stale), which `FakeBDNSClient` uses to filter by window exactly as the real API would with `fechaRegInicio`/`fechaRegFin`.
-
-### What's tested, by sync shape
-
-| Shape | Entities | Scenarios covered |
-|---|---|---|
-| **Simple catalog** (`test_timeline_full_catalogs.py`) | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones`, `sanciones_busqueda`, `grandesbeneficiarios_anios`, `planesestrategicos_busqueda` | Initial insert · no-op resync (touch only) · field rewrite (SCD2: old version closed, new one opened) · deletion detected via full reconciliation · new record insert |
-| **Swept** (`test_timeline_swept_catalogs.py`) | `organos`, `organos_agrupacion`, `reglamentos` | Same 5 scenarios above, plus: *every* declared sweep value (`idAdmon`/`ambito`) is actually requested, and populating a previously-empty sweep value never closes out another value's rows |
-| **Incremental window** (`test_timeline_incremental_windows.py`) | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | The `daily→weekly→monthly→annual` cascade progressively reveals older registrations · a correction to a 20-day-old record is missed by `daily` and `weekly`, caught by `monthly` · deletions are never detected (a window is a subset, not the full state) · new record insert · each window's date bounds match `WINDOWS` exactly |
-| **Discover-then-detail** (`test_timeline_convocatorias.py`) | `convocatorias` | Same window cascade · exactly one detail call per discovered code · detail rewrite · a malformed record is skipped without breaking the batch · deletions never detected · new arrival |
-| **Multi-table** (`test_timeline_multitable.py`) | `grandesbeneficiarios_busqueda`, `planesestrategicos`/`_vigencia` | The `anios` sweep is recomputed dynamically from the catalog (not hardcoded) · full reconciliation (insert/touch/rewrite/delete) over the discovered `idPES` set · a malformed record is skipped without breaking the batch · `_vigencia` reconciles as an independent table |
-
-These modules, together with `test_syncers.py`/`test_syncers_wiring.py` (a smoke test that all 22 entities are registered and callable), leave `scd2.py`, `generic.py`, `syncers.py`, `hashing.py`, and `schema.py` at 100% coverage.
 
 ## Development
 

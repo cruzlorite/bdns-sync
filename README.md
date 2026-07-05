@@ -5,7 +5,9 @@
 
 [🇬🇧 English version](./README.en.md)
 
-Motor de sincronización que mantiene copia versionada (SCD2) de la [API REST de la BDNS](https://www.infosubvenciones.es/bdnstrans/api) en la base de datos que elijas. Junto con [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) (el cliente/extracción) forman el mismo proyecto BDNS: `bdns-fetch` habla con la API, `bdns-sync` versiona lo que trae.
+Motor de sincronización que mantiene una copia versionada (SCD2) de la [API REST de la BDNS](https://www.infosubvenciones.es/bdnstrans/api) en la base de datos que elijas.
+
+Proyecto hermano: [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) habla con la API; `bdns-sync` versiona lo que trae.
 
 ## Instalación
 
@@ -84,32 +86,6 @@ Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosub
 - Sin reconciliación periódica de bajas para los grandes endpoints de búsqueda.
 - Registros puntuales pueden venir malformados (confirmado en vivo); se omiten con log en vez de romper el lote.
 - Sin backfill histórico para `convocatorias` (cada registro es una llamada real).
-
-## Testing
-
-Además de las pruebas unitarias de cada módulo (`tests/test_scd2.py`, `tests/test_generic.py`, `tests/test_hashing.py`...), hay una suite de **escenarios multi-día** (`tests/test_timeline_*.py`) que simula, para **las 22 entidades registradas** (17 `full` + 4 `search` + `convocatorias`), la secuencia real de ejecuciones de cron a lo largo del tiempo: alta inicial, resincronizaciones sin cambios, correcciones, bajas y altas nuevas.
-
-### Datos: reales, no inventados
-
-Los fixtures (`tests/fixtures/*.json`) son capturas reales del API en vivo, con nombres, NIF/CIF e identificadores sustituidos por valores ficticios (`ANONIMIZAR: sí` para todo lo que pudiera reidentificar a un beneficiario -- convocatorias, catálogos y organigramas públicos se dejan tal cual, no son datos personales). La forma exacta de los campos es la real.
-
-### Cómo se sustituye el API: `FakeBDNSClient`
-
-`bdns.sync.syncers` nunca importa ni comprueba el tipo de `BDNSClient` -- cada `sync_*` sólo llama a métodos `fetch_*` sobre el objeto `client` que recibe. Eso hace que un objeto Python cualquiera con esos mismos métodos sea un sustituto completo: no hace falta ninguna librería de mocking. `tests/fake_client.py` define `FakeBDNSClient`, cargado con los fixtures anonimizados y mutable entre "días" simulados (`client.sectores[0]["descripcion"] = "..."`, `client.concesiones_busqueda.pop()`, ...) para guionizar cada escenario.
-
-Para las entidades incrementales, cada registro del fixture lleva un `reg_days_ago` (días desde ayer, no una fecha absoluta -- así el fixture no caduca) que `FakeBDNSClient` usa para filtrar por ventana exactamente como haría la API real con `fechaRegInicio`/`fechaRegFin`.
-
-### Qué se prueba, por forma de sincronización
-
-| Forma | Entidades | Escenarios cubiertos |
-|---|---|---|
-| **Catálogo simple** (`test_timeline_full_catalogs.py`) | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones`, `sanciones_busqueda`, `grandesbeneficiarios_anios`, `planesestrategicos_busqueda` | Alta inicial · resync sin cambios (solo *touch*) · reescritura de un campo (SCD2: cierra versión vieja, abre nueva) · baja detectada por reconciliación completa · alta de un registro nuevo |
-| **Barrido** (`test_timeline_swept_catalogs.py`) | `organos`, `organos_agrupacion`, `reglamentos` | Los mismos 5 escenarios anteriores, más: se pide *todos* los valores de barrido declarados (`idAdmon`/`ambito`), y poblar un valor de barrido antes vacío no cierra los registros de otro valor |
-| **Incremental por ventana** (`test_timeline_incremental_windows.py`) | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | La cascada `daily→weekly→monthly→annual` revela progresivamente registros más antiguos · una corrección a un registro de hace 20 días la ignoran `daily` y `weekly`, la detecta `monthly` · nunca se detectan bajas (una ventana es un subconjunto, no el estado completo) · alta de un registro nuevo · los límites de fecha de cada ventana coinciden exactamente con `WINDOWS` |
-| **Descubre y detalla** (`test_timeline_convocatorias.py`) | `convocatorias` | Misma cascada de ventanas · exactamente una llamada de detalle por código descubierto · reescritura de un detalle · registro malformado se salta sin romper el lote · nunca se detectan bajas · alta nueva |
-| **Multi-tabla** (`test_timeline_multitable.py`) | `grandesbeneficiarios_busqueda`, `planesestrategicos`/`_vigencia` | El barrido de `anios` se recalcula dinámicamente desde el catálogo (no hardcodeado) · reconciliación completa (alta/touch/reescritura/baja) sobre el `idPES` descubierto · registro malformado se salta sin romper el lote · `_vigencia` se reconcilia como tabla independiente |
-
-Estos módulos, junto con `test_syncers.py`/`test_syncers_wiring.py` (smoke test de que las 22 entidades están registradas y son invocables), dejan `scd2.py`, `generic.py`, `syncers.py`, `hashing.py` y `schema.py` al 100% de cobertura.
 
 ## Desarrollo
 
