@@ -5,9 +5,9 @@
 
 [🇪🇸 Spanish version](./README.md)
 
-Sync engine that keeps a versioned (SCD2) copy of the [BDNS REST API](https://www.infosubvenciones.es/bdnstrans/api) in the database of your choice.
+Sync engine that keeps a versioned (SCD2) copy of the [BDNS REST API](https://www.infosubvenciones.es/bdnstrans/api).
 
-Sibling project: [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) talks to the API; `bdns-sync` versions what it brings back.
+[`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) implements an interface for extracting the data, `bdns-sync` provides a storage layer on top of `bdns-fetch`.
 
 A pure tool: one endpoint per invocation, no config file. Cadence lives in [`scripts/cron_dispatch.sh`](scripts/cron_dispatch.sh).
 
@@ -97,8 +97,14 @@ poetry run bdns-sync --help
 make test
 ```
 
+## Legal disclaimer
+
+Unofficial project, not affiliated with the Base de Datos Nacional de Subvenciones (BDNS) or Spain's Ministry of Finance. Distributed under the GPL v3, which expressly disclaims any warranty: use it at your own risk, with no warranty of any kind, and no liability accepted by the author for damages, data loss, or misuse.
+
+The synced data comes from the [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) and is subject to its own [legal notice](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) and [API good-practices document](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf) -- check them before redistributing anything extracted.
+
 ## License and links
 
 - [GNU GPL v3.0](./LICENSE)
-- [Official API](https://www.infosubvenciones.es/bdnstrans/api) · [BDNS Portal](https://www.infosubvenciones.es)
+- [Official API](https://www.infosubvenciones.es/bdnstrans/api) · [BDNS Portal](https://www.infosubvenciones.es) · [BDNS legal notice](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal)
 - Sibling project: [bdns-fetch](https://github.com/cruzlorite/bdns-fetch) (extraction)

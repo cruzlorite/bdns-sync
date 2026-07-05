@@ -5,9 +5,9 @@
 
 [🇬🇧 English version](./README.en.md)
 
-Motor de sincronización que mantiene una copia versionada (SCD2) de la [API REST de la BDNS](https://www.infosubvenciones.es/bdnstrans/api) en la base de datos que elijas.
+Motor de sincronización que mantiene una copia versionada (SCD2) de la [API REST de la BDNS](https://www.infosubvenciones.es/bdnstrans/api).
 
-Proyecto hermano: [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) habla con la API; `bdns-sync` versiona lo que trae.
+[`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) implementa una interfaz para extraer información, `bdns-sync` ofrece una capa de almacenamiento encima de `bdns-fetch`.
 
 ## Instalación
 
@@ -84,7 +84,6 @@ Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosub
 
 - `organos_codigo` / `organos_codigoadmin` sin implementar (grupo H).
 - Sin reconciliación periódica de bajas para los grandes endpoints de búsqueda.
-- Registros puntuales pueden venir malformados (confirmado en vivo); se omiten con log en vez de romper el lote.
 - Sin backfill histórico para `convocatorias` (cada registro es una llamada real).
 
 ## Desarrollo
@@ -95,8 +94,13 @@ poetry run bdns-sync --help
 make test
 ```
 
+## Aviso legal
+
+Proyecto no oficial, sin afiliación con la Base de Datos Nacional de Subvenciones (BDNS) ni con el Ministerio de Hacienda. Se distribuye bajo licencia GPL v3, que excluye expresamente cualquier garantía: se usa bajo tu propia responsabilidad, sin garantía de ningún tipo y sin que el autor asuma responsabilidad alguna por daños, pérdidas de datos o usos indebidos.
+
+Los datos sincronizados proceden del [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) y están sujetos a su propio [aviso legal](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) y a las [buenas prácticas de la API](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf).
 ## Licencia y enlaces
 
 - [GNU GPL v3.0](./LICENSE)
-- [API oficial](https://www.infosubvenciones.es/bdnstrans/api) · [Portal BDNS](https://www.infosubvenciones.es)
-- Proyecto hermano: [bdns-fetch](https://github.com/cruzlorite/bdns-fetch) (extracción)
+- [API oficial](https://www.infosubvenciones.es/bdnstrans/api) · [Portal BDNS](https://www.infosubvenciones.es) · [Aviso legal BDNS](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal)
+- [bdns-fetch](https://github.com/cruzlorite/bdns-fetch)
