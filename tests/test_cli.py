@@ -1,0 +1,67 @@
+from typer.testing import CliRunner
+
+from bdns.sync.cli import app
+
+runner = CliRunner()
+
+
+def test_version():
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert "bdns-sync" in result.output
+
+
+def test_list_full_includes_known_endpoints():
+    result = runner.invoke(app, ["list", "--kind", "full"])
+    assert result.exit_code == 0
+    assert "sectores" in result.output
+    assert "organos" in result.output
+
+
+def test_list_search_includes_known_endpoints():
+    result = runner.invoke(app, ["list", "--kind", "search"])
+    assert result.exit_code == 0
+    assert "concesiones_busqueda" in result.output
+
+
+def test_list_convocatorias():
+    result = runner.invoke(app, ["list", "--kind", "convocatorias"])
+    assert result.exit_code == 0
+    assert result.output.strip() == "convocatorias"
+
+
+def test_list_rejects_unknown_kind():
+    result = runner.invoke(app, ["list", "--kind", "bogus"])
+    assert result.exit_code != 0
+
+
+def test_sync_rejects_unknown_endpoint():
+    result = runner.invoke(app, ["sync", "not_a_real_endpoint", "--target-url", "sqlite:///:memory:"])
+    assert result.exit_code != 0
+
+
+def test_sync_incremental_endpoint_requires_window():
+    result = runner.invoke(
+        app, ["sync", "concesiones_busqueda", "--target-url", "sqlite:///:memory:"]
+    )
+    assert result.exit_code != 0
+
+
+def test_sync_convocatorias_requires_window():
+    result = runner.invoke(app, ["sync", "convocatorias", "--target-url", "sqlite:///:memory:"])
+    assert result.exit_code != 0
+
+
+def test_sync_rejects_unknown_window():
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "concesiones_busqueda",
+            "--target-url",
+            "sqlite:///:memory:",
+            "--window",
+            "bogus",
+        ],
+    )
+    assert result.exit_code != 0
