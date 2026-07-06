@@ -52,10 +52,10 @@ def test_convocatorias_discover_then_detail_end_to_end():
     assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0, "soft_deleted": 0, "skipped": 0}
     assert sorted(client.detail_calls) == ["A1", "A2"]
 
-    # daily covers just yesterday; the API's fechaHasta upper bound is
-    # exclusive, so it's sent as today (yesterday + 1) to include yesterday
+    # daily covers just yesterday; convocatorias' fechaHasta is inclusive,
+    # so it's sent as yesterday directly (no +1, unlike the fechaReg endpoints)
     yesterday = date.today() - timedelta(days=1)
-    assert client.last_search_window == (yesterday, date.today())
+    assert client.last_search_window == (yesterday, yesterday)
 
     rows = current_rows(engine, "convocatorias")
     assert {r["_natural_key"] for r in rows} == {'["A1"]', '["A2"]'}

@@ -170,17 +170,27 @@ class FakeBDNSClient:
 
     # Windowed search entities (reg-date cascade).
 
-    def _windowed(self, method: str, records: Iterable[dict], start: date, end: date):
-        """Models the real API's HALF-OPEN date range: the upper bound is
-        exclusive (matches registrations strictly before it), so a record on
-        day `end` is NOT returned. That's the whole reason callers must pass
-        `generic.to_api_upper_bound(chunk_end)`; if they forget, this filter
-        drops the boundary day exactly like the live API does, so the
-        regression tests catch it instead of silently passing.
+    def _windowed(
+        self, method: str, records: Iterable[dict], start: date, end: date, upper_inclusive: bool = False
+    ):
+        """Models the real API's date filtering, which differs by endpoint:
+
+        - The four `fechaRegFin` search endpoints use a HALF-OPEN range: the
+          upper bound is exclusive, so a record on day `end` is NOT returned
+          (`upper_inclusive=False`). That's why those callers must pass
+          `generic.to_api_upper_bound(chunk_end)`; if they forget, this drops
+          the boundary day exactly like the live API does, so the regression
+          tests catch it instead of silently passing.
+        - convocatorias' `fechaHasta` is INCLUSIVE (`upper_inclusive=True`):
+          a record on day `end` IS returned, so its caller must NOT add a day.
+
+        Both behaviors confirmed live; see `generic.to_api_upper_bound` and
+        `syncers.discover_convocatoria_codes`.
         """
         self.calls.append((method, {"start": start, "end": end}))
         for rec in records:
-            if start <= reg_date(rec["reg_days_ago"]) < end:
+            d = reg_date(rec["reg_days_ago"])
+            if start <= d <= end if upper_inclusive else start <= d < end:
                 yield rec["payload"]
 
     def fetch_concesiones_busqueda(self, fechaRegInicio, fechaRegFin):
@@ -204,8 +214,13 @@ class FakeBDNSClient:
         )
 
     def fetch_convocatorias_busqueda(self, fechaDesde, fechaHasta):
+        # convocatorias' fechaHasta is inclusive, unlike the fechaRegFin endpoints
         yield from self._windowed(
-            "fetch_convocatorias_busqueda", self.convocatorias_busqueda, fechaDesde, fechaHasta
+            "fetch_convocatorias_busqueda",
+            self.convocatorias_busqueda,
+            fechaDesde,
+            fechaHasta,
+            upper_inclusive=True,
         )
 
     # Discover-then-detail.

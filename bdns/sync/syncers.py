@@ -31,7 +31,6 @@ from bdns.sync.generic import (
     sync_full_catalog,
     sync_search_window,
     sync_swept_catalog,
-    to_api_upper_bound,
 )
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
 
@@ -231,13 +230,19 @@ CONVOCATORIAS_KEY_FIELDS = ("codigoBDNS",)
 def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> Set[str]:
     """Find every `numeroConvocatoria` registered in [start, end] (inclusive).
 
-    Chunked into `CHUNK_DAYS`-wide pieces like every other reg-date fetch;
-    see `generic.iter_date_chunks` for why.
+    Chunked into `CHUNK_DAYS`-wide pieces like every other reg-date fetch
+    (see `generic.iter_date_chunks`), but note the crucial difference from
+    the four `fechaRegFin` search endpoints: convocatorias' `fechaHasta`
+    upper bound is INCLUSIVE, not exclusive. Confirmed live -- `fechaHasta=D`
+    returns every convocatoria with `fechaRecepcion == D`, the whole day. So
+    `chunk_end` is sent as-is; it must NOT go through `to_api_upper_bound`
+    (that would over-fetch one extra day and pull convocatorias registered
+    outside the requested window).
     """
     codes: Set[str] = set()
     for chunk_start, chunk_end in iter_date_chunks(start, end):
         for item in client.fetch_convocatorias_busqueda(
-            fechaDesde=chunk_start, fechaHasta=to_api_upper_bound(chunk_end)
+            fechaDesde=chunk_start, fechaHasta=chunk_end
         ):
             codes.add(item["numeroConvocatoria"])
     return codes

@@ -72,9 +72,27 @@ Tens of millions of rows -- fetching them whole every time isn't viable.
 
 Registration date doesn't change when a record is edited, so re-querying the same window later won't find new additions, but will catch edits via hash. Corrections cluster near registration time and taper off with age, hence the cascade: `daily` always runs, `weekly`/`monthly`/`annual` are *extra* checks the same day, not replacements for it.
 
-**How the window is interpreted** (important, easy to get wrong): windows are expressed as day ranges inclusive on both ends, but the API's `fechaRegFin`/`fechaHasta` parameter is **exclusive** -- it only counts registrations strictly before 00:00 of that date, not the date's own day. Confirmed live across all 5 entities: asking for `fechaRegFin=D` for a single day `D` returns ~0 rows, while `fechaRegFin=D+1` returns the whole day (for `concesiones_busqueda`, 1 vs 58,488 rows for one day). The bridge between the two conventions is centralized and named in one place, `generic.to_api_upper_bound(inclusive_end)`, which adds that day. Without it, `daily` (start == end) would fetch almost nothing and every wider window would drop its most recent day.
+#### How date windows are queried (real API behavior)
 
-Every window, whatever its size, gets split into pieces of at most 7 days before being fetched (`generic.iter_date_chunks`). `daily`/`weekly` already fit in one piece, so nothing changes for them; `monthly`/`annual` do get chunked. Because the exclusive-end bridge is applied per piece, the result doesn't depend on chunk size: confirmed live, a 14-day `partidospoliticos_busqueda` range returns exactly the same 36 rows whether chunked into 1-, 7-, or 14-day pieces. Also tested on `concesiones_busqueda`: a single 30-day call took 286.7s; the same range chunked into weeks took 142.5s, both with zero errors. A multi-year range in one call does fail intermittently (see below): chunking isn't just faster, it avoids that failure.
+This part gathers several findings confirmed live against the API. They're documented in detail because they're subtle, absent from (or contradicted by) the official docs, and getting them wrong silently loses data.
+
+**1. A window is a day range inclusive on both ends.** `daily` for day `X` means "registrations from `X`". The upper end of every window is *yesterday* (`date.today() - 1`), because "today"'s data isn't final until the next morning.
+
+**2. The API's upper bound has OPPOSITE semantics depending on the endpoint.** There are two families of date parameters, and they behave inversely:
+
+| Family | Parameters | Endpoints | Upper bound | Live check (day `D`) |
+|---|---|---|---|---|
+| Registration-date search | `fechaRegInicio` / `fechaRegFin` | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | **exclusive** (excludes day `D`) | `fechaRegFin=D` → ~0 rows for `D`; `fechaRegFin=D+1` → full day `D` (concesiones: 1 vs 58,488) |
+| Convocatorias discovery | `fechaDesde` / `fechaHasta` | `convocatorias` (discovery step) | **inclusive** (includes day `D`) | `fechaHasta=D` → every convocatoria with `fechaRecepcion == D`; `fechaHasta=D+1` → days `D` and `D+1` |
+
+The bridge from our inclusive convention to the exclusive family lives in one named place, `generic.to_api_upper_bound(inclusive_end)`, which adds a day. Convocatorias does **not** use it: its `fechaHasta` is already inclusive, so adding a day would pull in convocatorias from outside the window. Had this gone unnoticed: `daily` for the four `fechaReg` endpoints would fetch almost nothing, and every wider window would drop its most recent day (and once chunked, one day per chunk boundary -- a 28-day range chunked by day returned 8 rows instead of ~1.2M).
+
+**3. Every window is split into pieces of at most 7 days before being fetched** (`generic.iter_date_chunks`). `daily`/`weekly` already fit in one piece, unchanged; `monthly`/`annual` get chunked. Two reasons, both confirmed live against `concesiones_busqueda`:
+
+- **Reliability**: a 4-year range (27.4M rows) returns `ERR_MANTENIMIENTO_BBDD` intermittently at any page depth; a one-week window over the same dates didn't fail once in 6 tries.
+- **Speed**: a single 30-day call took 286.7s; the same range chunked into weeks took 142.5s, both with zero errors.
+
+Because the date bridge is applied per piece, **the result doesn't depend on chunk size**: a 14-day `partidospoliticos_busqueda` range returns exactly the same 36 rows chunked into 1-, 7-, or 14-day pieces (confirmed live).
 
 **Window-scoped deletion detection**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, and `convocatorias` also detect real deletions, by comparing, within the same run, what was fetched against the table rows whose own registration date (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, depending on the entity) falls in that same range. This is never compared against the previous run, since that would produce constant false positives: every row eventually ages out of a rolling window regardless of deletion. `partidospoliticos_busqueda` is excluded: confirmed live that its payload never exposes a registration-date field, despite the official doc claiming it "works the same, same filters and results" as `concesiones_busqueda`. It doesn't. This is a real, permanent limitation unless the API changes.
 

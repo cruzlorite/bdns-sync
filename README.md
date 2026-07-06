@@ -70,9 +70,27 @@ Decenas de millones de filas -- traerlos enteros cada vez es inviable.
 
 La fecha de registro no cambia al editar un registro, así que reconsultar la misma ventana más tarde no encuentra altas nuevas, pero sí detecta ediciones por hash. Las correcciones se concentran cerca del registro y bajan con la antigüedad, de ahí la cascada: `daily` siempre corre, `weekly`/`monthly`/`annual` son verificaciones *extra* el mismo día, no sustituyen a la diaria.
 
-**Cómo se interpreta la ventana** (importante, es fácil equivocarse): las ventanas se expresan como rangos de días inclusivos por ambos extremos, pero el parámetro `fechaRegFin`/`fechaHasta` del API es **exclusivo** -- solo cuenta los registros anteriores a las 00:00 de esa fecha, no incluye el día en sí. Comprobado en vivo en las 5 entidades: pedir `fechaRegFin=D` para un solo día `D` devuelve ~0 filas, mientras que `fechaRegFin=D+1` devuelve el día entero (en `concesiones_busqueda`, 1 vs 58.488 filas para un día cualquiera). El puente entre las dos convenciones está centralizado y con nombre propio en un único sitio, `generic.to_api_upper_bound(fin_inclusivo)`, que suma ese día. Sin él, `daily` (inicio == fin) no traería casi nada y toda ventana más ancha perdería su día más reciente.
+#### Cómo se consultan las ventanas de fecha (comportamiento real del API)
 
-Cada ventana, sea del tamaño que sea, se descompone en piezas de máximo 7 días antes de pedirlas (`generic.iter_date_chunks`). `daily`/`weekly` ya caben en una sola pieza, así que no cambian; `monthly`/`annual` sí se trocean. Como el puente exclusivo se aplica por pieza, el resultado no depende del tamaño de trozo: comprobado en vivo, un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días. Probado también en `concesiones_busqueda`: un rango de 30 días de una sola vez tardó 286,7s; el mismo rango troceado en semanas tardó 142,5s, ambos sin errores. Un rango de varios años en una sola llamada sí falla de forma intermitente (ver más abajo) -- trocear no es solo más rápido, evita ese fallo.
+Esta parte concentra varios hallazgos comprobados en vivo contra el API. Se documentan en detalle porque son sutiles, no están en la documentación oficial (o la contradicen), y equivocarse aquí provoca pérdida silenciosa de datos.
+
+**1. La ventana es un rango de días inclusivo por ambos extremos.** `daily` sobre el día `X` significa "los registros de `X`". El extremo superior de toda ventana es *ayer* (`date.today() - 1`), porque los datos de "hoy" no están cerrados hasta la mañana siguiente.
+
+**2. El extremo superior del API tiene semántica OPUESTA según el endpoint.** Hay dos familias de parámetros de fecha, y se comportan al revés:
+
+| Familia | Parámetros | Endpoints | Extremo superior | Comprobación en vivo (día `D`) |
+|---|---|---|---|---|
+| Búsqueda por fecha de registro | `fechaRegInicio` / `fechaRegFin` | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | **exclusivo** (no incluye el día `D`) | `fechaRegFin=D` → ~0 filas de `D`; `fechaRegFin=D+1` → día `D` completo (en `concesiones`, 1 vs 58.488) |
+| Descubrimiento de convocatorias | `fechaDesde` / `fechaHasta` | `convocatorias` (paso de descubrimiento) | **inclusivo** (sí incluye el día `D`) | `fechaHasta=D` → todas las convocatorias con `fechaRecepcion == D`; `fechaHasta=D+1` → días `D` y `D+1` |
+
+El puente entre nuestra convención (inclusiva) y la familia exclusiva está en un único sitio con nombre propio, `generic.to_api_upper_bound(fin_inclusivo)`, que suma un día. Convocatorias **no** lo usa: su `fechaHasta` ya es inclusivo, sumar un día traería convocatorias de fuera de la ventana. Si esto no se hubiera detectado: `daily` de los cuatro endpoints `fechaReg` no traería casi nada, y toda ventana más ancha perdería su día más reciente (y, una vez troceada, un día por cada frontera de trozo -- un rango de 28 días troceado por día devolvía 8 filas en vez de ~1,2M).
+
+**3. Cada ventana se trocea en piezas de máximo 7 días antes de pedirla** (`generic.iter_date_chunks`). `daily`/`weekly` ya caben en una pieza, no cambian; `monthly`/`annual` sí se trocean. Motivos, ambos comprobados en vivo contra `concesiones_busqueda`:
+
+- **Fiabilidad**: un rango de 4 años (27,4M filas) devuelve `ERR_MANTENIMIENTO_BBDD` de forma intermitente en cualquier profundidad de página; una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos.
+- **Velocidad**: un rango de 30 días de una sola vez tardó 286,7s; el mismo rango troceado en semanas tardó 142,5s, ambos sin errores.
+
+Como el puente de fecha se aplica por pieza, **el resultado no depende del tamaño de trozo**: un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días (comprobado en vivo).
 
 **Detección de bajas por ventana**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda` y `convocatorias` también detectan bajas reales, comparando, dentro de la misma ejecución, lo traído contra las filas de la tabla cuya propia fecha de registro (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, según la entidad) cae en ese mismo rango. No se compara contra la ejecución anterior, porque eso daría falsos positivos constantes: toda fila envejece fuera de una ventana móvil tarde o temprano, sin que eso signifique baja. `partidospoliticos_busqueda` queda fuera: confirmado en vivo que su payload no expone ningún campo de fecha de registro, pese a que el documento oficial afirma que "funciona igual, con los mismos filtros y resultados" que `concesiones_busqueda`. No es así. Es una limitación real y permanente, salvo que la API cambie.
 

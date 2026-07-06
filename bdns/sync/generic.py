@@ -56,21 +56,27 @@ def iter_date_chunks(start: date, end: date, chunk_days: int = CHUNK_DAYS) -> It
 
 def to_api_upper_bound(inclusive_end: date) -> date:
     """Translate an inclusive end date (how windows and chunks are expressed
-    everywhere else in this codebase) into the value the BDNS API actually
-    expects for `fechaRegFin` / `fechaHasta`.
+    everywhere else in this codebase) into the value the four `fechaRegFin`
+    search endpoints expect.
 
-    The API treats that upper bound as EXCLUSIVE: it matches registrations
-    strictly before 00:00 of the given date, i.e. it does NOT include the
-    date's own day. Confirmed live against concesiones_busqueda: querying
-    fechaRegFin=D returned 0-1 rows for day D, while fechaRegFin=D+1 returned
-    ~75,000. Left as a bare `fechaRegFin=end`, `daily` (start == end) fetches
-    almost nothing, and every wider window silently drops its most recent
-    day per chunk.
+    Those endpoints (concesiones/ayudasestado/minimis/partidospoliticos)
+    treat `fechaRegFin` as EXCLUSIVE: it matches registrations strictly
+    before 00:00 of the given date, so it does NOT include the date's own
+    day. Confirmed live: querying `fechaRegFin=D` returned 0 rows for day D
+    (concesiones leaked a single midnight-exact row), while `fechaRegFin=D+1`
+    returned the whole day (~58,000 for concesiones). Left as a bare
+    `fechaRegFin=end`, `daily` (start == end) fetches almost nothing, and
+    every wider window silently drops its most recent day per chunk.
 
     So the single, named, deliberate bridge: to include every registration
     made on `inclusive_end`, ask the API for the day after. This is the only
     place that crosses from our inclusive convention to the API's half-open
     one -- keep it here, not inlined as a `+ 1` at call sites.
+
+    IMPORTANT: this is NOT universal. convocatorias' discovery uses a
+    different parameter, `fechaHasta`, which is INCLUSIVE (also confirmed
+    live: `fechaHasta=D` returns the full day D). That path must NOT call
+    this function -- see `syncers.discover_convocatoria_codes`.
     """
     return inclusive_end + timedelta(days=1)
 
