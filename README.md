@@ -87,7 +87,7 @@ Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosub
 - `organos_codigo` / `organos_codigoadmin` sin implementar (grupo H).
 - `partidospoliticos_busqueda` sin detección de bajas: a diferencia de las otras 4 entidades incrementales, su payload no expone ningún campo de fecha de registro (confirmado en vivo con más de 70 filas reales, en dos rangos de fecha distintos).
 - Registros individuales malformados se descartan con log (nivel WARNING), se cuentan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto + contenido truncado a 200 caracteres, enlazado por `run_id`). Nunca se guardan en las tablas sincronizadas: no tienen clave natural real, así que no se pueden versionar como una fila normal.
-- Sin backfill histórico para `convocatorias` (cada registro es una llamada real).
+- Sin backfill histórico para los 5 endpoints incrementales (`concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda`, `convocatorias`): la ventana más ancha es `annual` (365 días), pero las ayudas siguen visibles 4 años. Un rango de varios años en una sola llamada no es solo lento: probado en vivo (4 años, `concesiones_busqueda`, 27,4M filas), la API devuelve `ERR_MANTENIMIENTO_BBDD` de forma intermitente en ese rango, en cualquier profundidad de página, mientras que una ventana semanal en el mismo rango de fechas no falló ninguna vez en 6 intentos. Si se implementa backfill, tiene que trocear por semanas/meses, no pedir el histórico completo de una vez.
 
 ## Desarrollo
 

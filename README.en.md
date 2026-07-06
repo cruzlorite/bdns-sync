@@ -89,7 +89,7 @@ Per the official ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.e
 - `organos_codigo` / `organos_codigoadmin` not implemented (group H).
 - `partidospoliticos_busqueda` has no deletion detection: unlike the other 4 incremental entities, its payload never exposes a registration-date field (confirmed live with 70+ real rows across two different date ranges).
 - Individual malformed records are skipped with a log (WARNING level), counted in `_sync_runs.rows_skipped`, and recorded in `_sync_errors` (context plus content truncated to 200 characters, linked by `run_id`). They're never stored in the synced tables: a malformed record has no real natural key, so it can't be versioned like a normal row.
-- No historical backfill for `convocatorias` (each record is a real API call).
+- No historical backfill for the 5 incremental endpoints (`concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda`, `convocatorias`): the widest window is `annual` (365 days), but grants stay visible for 4 years. A multi-year range in a single call isn't just slow: tested live (4 years, `concesiones_busqueda`, 27.4M rows), the API returns `ERR_MANTENIMIENTO_BBDD` intermittently across that range, at any page depth, while a one-week window over the same date range didn't fail once in 6 tries. If backfill ever gets built, it needs to chunk by week or month, not request the whole history in one shot.
 
 ## Development
 
