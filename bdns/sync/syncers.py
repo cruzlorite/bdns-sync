@@ -31,6 +31,7 @@ from bdns.sync.generic import (
     sync_full_catalog,
     sync_search_window,
     sync_swept_catalog,
+    to_api_upper_bound,
 )
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
 
@@ -235,7 +236,9 @@ def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> S
     """
     codes: Set[str] = set()
     for chunk_start, chunk_end in iter_date_chunks(start, end):
-        for item in client.fetch_convocatorias_busqueda(fechaDesde=chunk_start, fechaHasta=chunk_end):
+        for item in client.fetch_convocatorias_busqueda(
+            fechaDesde=chunk_start, fechaHasta=to_api_upper_bound(chunk_end)
+        ):
             codes.add(item["numeroConvocatoria"])
     return codes
 

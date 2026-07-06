@@ -171,9 +171,16 @@ class FakeBDNSClient:
     # Windowed search entities (reg-date cascade).
 
     def _windowed(self, method: str, records: Iterable[dict], start: date, end: date):
+        """Models the real API's HALF-OPEN date range: the upper bound is
+        exclusive (matches registrations strictly before it), so a record on
+        day `end` is NOT returned. That's the whole reason callers must pass
+        `generic.to_api_upper_bound(chunk_end)`; if they forget, this filter
+        drops the boundary day exactly like the live API does, so the
+        regression tests catch it instead of silently passing.
+        """
         self.calls.append((method, {"start": start, "end": end}))
         for rec in records:
-            if start <= reg_date(rec["reg_days_ago"]) <= end:
+            if start <= reg_date(rec["reg_days_ago"]) < end:
                 yield rec["payload"]
 
     def fetch_concesiones_busqueda(self, fechaRegInicio, fechaRegFin):

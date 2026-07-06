@@ -3,7 +3,13 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import MetaData, create_engine, select
 
-from bdns.sync.generic import iter_date_chunks, sync_full_catalog, sync_search_window, sync_swept_catalog
+from bdns.sync.generic import (
+    iter_date_chunks,
+    sync_full_catalog,
+    sync_search_window,
+    sync_swept_catalog,
+    to_api_upper_bound,
+)
 from bdns.sync.schema import build_control_tables, build_sync_table
 
 
@@ -58,6 +64,39 @@ def test_iter_date_chunks_are_contiguous_with_no_gaps_or_overlaps():
         assert next_start == prev_end + timedelta(days=1)
     for chunk_start, chunk_end in chunks:
         assert (chunk_end - chunk_start).days < 7
+
+
+# --- to_api_upper_bound + chunk coverage ------------------------------------
+
+
+def test_to_api_upper_bound_is_the_day_after():
+    assert to_api_upper_bound(date(2024, 1, 15)) == date(2024, 1, 16)
+
+
+def test_chunked_api_intervals_tile_the_range_exactly_regardless_of_chunk_size():
+    """The regression this locks in: the API's upper bound is exclusive, so a
+    bare `fechaRegFin=chunk_end` drops each chunk's last day, and more chunks
+    meant more lost days (a 28-day range fetched in 1-day chunks returned 8
+    rows instead of 1.2M, confirmed live). Routing every chunk end through
+    `to_api_upper_bound` makes the half-open intervals
+    [chunk_start, to_api_upper_bound(chunk_end)) tile the full inclusive
+    range exactly once -- every day covered, no gaps, no overlaps -- for any
+    chunk size. That's what makes row totals independent of how the range was
+    split.
+    """
+    start, end = date(2024, 1, 1), date(2024, 3, 31)  # 91 inclusive days
+    expected_days = {start + timedelta(days=i) for i in range((end - start).days + 1)}
+
+    for chunk_days in (1, 2, 7, 14, 30, 91, 200):
+        covered = []
+        for chunk_start, chunk_end in iter_date_chunks(start, end, chunk_days=chunk_days):
+            day = chunk_start
+            while day < to_api_upper_bound(chunk_end):  # exclusive upper bound
+                covered.append(day)
+                day += timedelta(days=1)
+        # set equality proves no gaps; equal length proves no overlaps/dupes
+        assert set(covered) == expected_days
+        assert len(covered) == len(expected_days)
 
 
 # --- sync_full_catalog ----------------------------------------------------
@@ -165,8 +204,10 @@ def test_search_window_incremental_no_deletion_detection():
     )
     assert stats == {"fetched": 1, "inserted": 0, "updated": 0, "touched": 1}
 
+    # daily covers just yesterday, but the API upper bound is exclusive, so
+    # fechaRegFin is sent as today (yesterday + 1) to include yesterday's day
     yesterday = date.today() - timedelta(days=1)
-    assert client.last_window == (yesterday, yesterday)
+    assert client.last_window == (yesterday, date.today())
     assert len(current_rows(engine, "widgets_busqueda")) == 2  # id=2 not closed
 
 

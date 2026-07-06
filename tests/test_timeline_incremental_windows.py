@@ -215,9 +215,12 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     behavior" check.
 
     The fetch is chunked into `CHUNK_DAYS`-wide pieces (see generic.py), so
-    for `monthly`/`annual` this is several calls, not one. What matters is
-    that the chunks are contiguous, none wider than `CHUNK_DAYS`, and
-    together cover exactly the range the README documents.
+    for `monthly`/`annual` this is several calls, not one. Each call's `end`
+    in the log is the API's *exclusive* upper bound (inclusive chunk end + 1,
+    see `to_api_upper_bound`), so a chunk covering days [s, e] is recorded as
+    (s, e + 1). What matters: chunks are contiguous, none spans more than
+    `CHUNK_DAYS` days, and together they cover exactly the documented range,
+    with the final exclusive bound one day past yesterday.
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
@@ -230,12 +233,42 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     expected_start = expected_end - timedelta(days=days - 1)
 
     for call in calls:
-        assert (call["end"] - call["start"]).days < CHUNK_DAYS
+        # end is exclusive, so a full CHUNK_DAYS-wide chunk spans exactly CHUNK_DAYS
+        assert (call["end"] - call["start"]).days <= CHUNK_DAYS
 
     assert calls[0]["start"] == expected_start
-    assert calls[-1]["end"] == expected_end
+    assert calls[-1]["end"] == expected_end + timedelta(days=1)  # exclusive upper bound
     for prev, nxt in zip(calls, calls[1:]):
-        assert nxt["start"] == prev["end"] + timedelta(days=1)
+        # next chunk's inclusive start meets the previous chunk's exclusive end
+        assert nxt["start"] == prev["end"]
+
+
+@pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)
+def test_no_day_is_dropped_at_chunk_boundaries(endpoint, key_fields):
+    """End-to-end guard for the exclusive-upper-bound bug: seed a distinct
+    record on every single day of a monthly window (0..29 days ago),
+    including the days that fall on chunk boundaries, and assert every one is
+    fetched. Before the fix, a bare `fechaRegFin=chunk_end` dropped each
+    chunk's last day, so the boundary-day records went missing.
+    """
+    from tests.fake_client import REG_DATE_FIELDS, reg_date
+
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_fn = SEARCH_SYNCERS[endpoint]
+
+    records = getattr(client, endpoint)
+    records.clear()
+    reg_field = REG_DATE_FIELDS.get(endpoint)
+    for days_ago in range(30):  # every day of the monthly window
+        payload = {key_fields[0]: 500000 + days_ago}
+        if reg_field:
+            payload[reg_field] = reg_date(days_ago).isoformat()
+        records.append({"reg_days_ago": days_ago, "payload": payload})
+
+    stats = sync_fn(engine, client, "monthly")
+    assert stats["inserted"] == 30  # not one day lost at any chunk boundary
+    assert len(current_rows(engine, endpoint)) == 30
 
 
 def test_search_syncers_registry_covers_every_incremental_entity():

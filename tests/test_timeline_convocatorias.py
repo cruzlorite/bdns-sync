@@ -7,7 +7,6 @@ detail responses must be skipped rather than crash the run.
 """
 
 from copy import deepcopy
-from datetime import timedelta
 
 from sqlalchemy import create_engine
 
@@ -46,12 +45,14 @@ def test_convocatorias_discovery_is_chunked_for_wide_windows():
     client = FakeBDNSClient()
     sync_convocatorias(engine, client, "monthly")
 
+    # `end` in the log is the API's exclusive upper bound (see
+    # to_api_upper_bound), so a chunk spanning days [s, e] shows as (s, e+1)
     calls = sorted(client.calls_to("fetch_convocatorias_busqueda"), key=lambda c: c["start"])
     assert len(calls) > 1
     for call in calls:
-        assert (call["end"] - call["start"]).days < CHUNK_DAYS
+        assert (call["end"] - call["start"]).days <= CHUNK_DAYS
     for prev, nxt in zip(calls, calls[1:]):
-        assert nxt["start"] == prev["end"] + timedelta(days=1)
+        assert nxt["start"] == prev["end"]
 
 
 def test_convocatorias_one_detail_call_per_discovered_code():
