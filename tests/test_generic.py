@@ -11,6 +11,7 @@ from bdns.sync.generic import (
     to_api_upper_bound,
 )
 from bdns.sync.schema import build_control_tables, build_sync_table
+from tests.fake_client import FakeBDNSClient, reg_date
 
 
 def current_rows(engine, name):
@@ -97,6 +98,74 @@ def test_chunked_api_intervals_tile_the_range_exactly_regardless_of_chunk_size()
         # set equality proves no gaps; equal length proves no overlaps/dupes
         assert set(covered) == expected_days
         assert len(covered) == len(expected_days)
+
+
+# --- belt-and-suspenders: adjacent days are disjoint and additive ----------
+
+
+def _reg_fam_ids(fetch, key, day_lo, day_hi):
+    """Fetch natural keys for [day_lo, day_hi] the way production does for the
+    four fechaRegFin endpoints: upper bound is exclusive, so +1 via the bridge.
+    """
+    return {row[key] for row in fetch(fechaRegInicio=day_lo, fechaRegFin=to_api_upper_bound(day_hi))}
+
+
+def _convo_codes(client, day_lo, day_hi):
+    """Fetch codes the way production does for convocatorias discovery:
+    fechaHasta is inclusive, so NO +1.
+    """
+    return {r["numeroConvocatoria"] for r in client.fetch_convocatorias_busqueda(fechaDesde=day_lo, fechaHasta=day_hi)}
+
+
+def test_adjacent_single_days_are_disjoint_and_their_union_is_the_two_day_range():
+    """Belt-and-suspenders mirroring the live check across all 5 endpoints.
+    For two adjacent single days X and X+1, fetched through the exact
+    per-family bridge production uses, prove both invariants at once:
+
+    - no overlap:  fetch(X) & fetch(X+1) == empty  (proves we don't over-fetch;
+      an off-by-one on the exclusive endpoints, or a wrong bound on the
+      inclusive one, would double-count the boundary day here)
+    - no gap:      fetch(X) | fetch(X+1) == fetch([X, X+1])  (proves we don't
+      under-fetch; a dropped boundary day would break this)
+
+    Confirmed live with real data (concesiones: 115,862 + 68,457 = 184,319,
+    overlap 0); this locks the same property in against future regressions.
+    `dayA` and `dayB` are adjacent calendar days (dayB is one day after dayA).
+    """
+    client = FakeBDNSClient()
+    dayA, dayB = reg_date(11), reg_date(10)  # reg_date(10) is one day after reg_date(11)
+    assert dayB == dayA + timedelta(days=1)
+
+    # four fechaRegFin endpoints (exclusive upper bound, +1 bridge)
+    reg_cases = [
+        (client.fetch_concesiones_busqueda, "id", client.concesiones_busqueda),
+        (client.fetch_ayudasestado_busqueda, "idConcesion", client.ayudasestado_busqueda),
+        (client.fetch_minimis_busqueda, "idConcesion", client.minimis_busqueda),
+        (client.fetch_partidospoliticos_busqueda, "id", client.partidospoliticos_busqueda),
+    ]
+    for fetch, key, records in reg_cases:
+        records.clear()
+        records.append({"reg_days_ago": 11, "payload": {key: 1}})
+        records.append({"reg_days_ago": 10, "payload": {key: 2}})
+
+        a = _reg_fam_ids(fetch, key, dayA, dayA)
+        b = _reg_fam_ids(fetch, key, dayB, dayB)
+        both = _reg_fam_ids(fetch, key, dayA, dayB)
+        assert a == {1} and b == {2}
+        assert a & b == set()  # disjoint, no overlap
+        assert a | b == both  # additive, no gap
+
+    # convocatorias discovery (inclusive fechaHasta, no +1)
+    client.convocatorias_busqueda = [
+        {"reg_days_ago": 11, "payload": {"numeroConvocatoria": "C-A"}},
+        {"reg_days_ago": 10, "payload": {"numeroConvocatoria": "C-B"}},
+    ]
+    a = _convo_codes(client, dayA, dayA)
+    b = _convo_codes(client, dayB, dayB)
+    both = _convo_codes(client, dayA, dayB)
+    assert a == {"C-A"} and b == {"C-B"}
+    assert a & b == set()
+    assert a | b == both
 
 
 # --- sync_full_catalog ----------------------------------------------------
