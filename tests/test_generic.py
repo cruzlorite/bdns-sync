@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import MetaData, create_engine, select
 
-from bdns.sync.generic import sync_full_catalog, sync_search_window, sync_swept_catalog
+from bdns.sync.generic import iter_date_chunks, sync_full_catalog, sync_search_window, sync_swept_catalog
 from bdns.sync.schema import build_control_tables, build_sync_table
 
 
@@ -14,6 +14,50 @@ def current_rows(engine, name):
         return conn.execute(
             select(table).where(table.c._is_current.is_(True))
         ).mappings().all()
+
+
+# --- iter_date_chunks -------------------------------------------------------
+
+
+def test_iter_date_chunks_splits_a_long_range_into_7_day_pieces():
+    start = date(2024, 1, 1)
+    end = date(2024, 1, 31)  # 31 days: 4 full weeks + a 3-day remainder
+    chunks = list(iter_date_chunks(start, end, chunk_days=7))
+
+    assert chunks == [
+        (date(2024, 1, 1), date(2024, 1, 7)),
+        (date(2024, 1, 8), date(2024, 1, 14)),
+        (date(2024, 1, 15), date(2024, 1, 21)),
+        (date(2024, 1, 22), date(2024, 1, 28)),
+        (date(2024, 1, 29), date(2024, 1, 31)),
+    ]
+
+
+def test_iter_date_chunks_single_day_range_is_one_chunk():
+    d = date(2024, 1, 1)
+    assert list(iter_date_chunks(d, d, chunk_days=7)) == [(d, d)]
+
+
+def test_iter_date_chunks_range_shorter_than_chunk_size_is_one_chunk():
+    start, end = date(2024, 1, 1), date(2024, 1, 5)
+    assert list(iter_date_chunks(start, end, chunk_days=7)) == [(start, end)]
+
+
+def test_iter_date_chunks_range_exactly_one_chunk_wide():
+    start, end = date(2024, 1, 1), date(2024, 1, 7)
+    assert list(iter_date_chunks(start, end, chunk_days=7)) == [(start, end)]
+
+
+def test_iter_date_chunks_are_contiguous_with_no_gaps_or_overlaps():
+    start, end = date(2024, 1, 1), date(2024, 3, 1)
+    chunks = list(iter_date_chunks(start, end, chunk_days=7))
+
+    assert chunks[0][0] == start
+    assert chunks[-1][1] == end
+    for (_, prev_end), (next_start, _) in zip(chunks, chunks[1:]):
+        assert next_start == prev_end + timedelta(days=1)
+    for chunk_start, chunk_end in chunks:
+        assert (chunk_end - chunk_start).days < 7
 
 
 # --- sync_full_catalog ----------------------------------------------------

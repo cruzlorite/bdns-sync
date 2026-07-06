@@ -25,7 +25,13 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
-from bdns.sync.generic import WINDOWS, sync_full_catalog, sync_search_window, sync_swept_catalog
+from bdns.sync.generic import (
+    WINDOWS,
+    iter_date_chunks,
+    sync_full_catalog,
+    sync_search_window,
+    sync_swept_catalog,
+)
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
 
 logger = logging.getLogger(__name__)
@@ -222,10 +228,15 @@ CONVOCATORIAS_KEY_FIELDS = ("codigoBDNS",)
 
 
 def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> Set[str]:
-    """Find every `numeroConvocatoria` registered in [start, end] (inclusive)."""
+    """Find every `numeroConvocatoria` registered in [start, end] (inclusive).
+
+    Chunked into `CHUNK_DAYS`-wide pieces like every other reg-date fetch;
+    see `generic.iter_date_chunks` for why.
+    """
     codes: Set[str] = set()
-    for item in client.fetch_convocatorias_busqueda(fechaDesde=start, fechaHasta=end):
-        codes.add(item["numeroConvocatoria"])
+    for chunk_start, chunk_end in iter_date_chunks(start, end):
+        for item in client.fetch_convocatorias_busqueda(fechaDesde=chunk_start, fechaHasta=chunk_end):
+            codes.add(item["numeroConvocatoria"])
     return codes
 
 

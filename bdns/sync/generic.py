@@ -17,7 +17,7 @@ mechanical "fetch, then apply" plumbing lives here.
 """
 
 from datetime import date, timedelta
-from typing import Dict, Sequence
+from typing import Dict, Iterator, Sequence, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
@@ -32,6 +32,26 @@ WINDOWS: Dict[str, int] = {
     "monthly": 30,
     "annual": 365,
 }
+
+# Every reg-date fetch is chunked into pieces this wide, regardless of the
+# requested window. Live-tested against concesiones_busqueda: a 7-day range
+# pulled cleanly (147,856 rows, 0 errors), while a 4-year range failed
+# intermittently with ERR_MANTENIMIENTO_BBDD at every page depth. `daily`
+# and `weekly` are already this size or smaller, so chunking is a no-op for
+# them; `monthly` and `annual` are the ones this actually protects.
+CHUNK_DAYS = 7
+
+
+def iter_date_chunks(start: date, end: date, chunk_days: int = CHUNK_DAYS) -> Iterator[Tuple[date, date]]:
+    """Split [start, end] (inclusive) into chunks of at most `chunk_days`,
+    contiguous and non-overlapping. Yields (start, end) is always at least
+    one item even if `start == end`.
+    """
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
+        yield current, chunk_end
+        current = chunk_end + timedelta(days=1)
 
 
 def sync_full_catalog(
@@ -99,11 +119,21 @@ def sync_search_window(
     `scd2.apply_incremental`). Only entities that actually expose their own
     registration date in the payload can use this; that was confirmed live
     per entity, not assumed.
+
+    The fetch itself is chunked into `CHUNK_DAYS`-wide pieces (see there for
+    why); `window_start`/`window_end` passed to `apply_incremental` still
+    cover the full requested window, since deletion scoping cares about the
+    whole window, not how it was split up to fetch it.
     """
     fetch = getattr(client, fetch_method_name)
     days = WINDOWS[window]
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=days - 1)
+
+    def rows():
+        for chunk_start, chunk_end in iter_date_chunks(start, end):
+            yield from fetch(fechaRegInicio=chunk_start, fechaRegFin=chunk_end)
+
     return run_with_bookkeeping(
         engine,
         endpoint_name,
@@ -112,7 +142,7 @@ def sync_search_window(
             conn,
             table,
             staging,
-            fetch(fechaRegInicio=start, fechaRegFin=end),
+            rows(),
             key_fields,
             reg_date_field=reg_date_field,
             window_start=start,

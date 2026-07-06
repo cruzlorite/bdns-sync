@@ -32,7 +32,7 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import create_engine
 
-from bdns.sync.generic import WINDOWS
+from bdns.sync.generic import CHUNK_DAYS, WINDOWS
 from bdns.sync.syncers import SEARCH_SYNCERS
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows
@@ -213,6 +213,11 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     reg-date range the README documents: ending yesterday, spanning `days`
     days back. This is the "does the CLI option actually change API request
     behavior" check.
+
+    The fetch is chunked into `CHUNK_DAYS`-wide pieces (see generic.py), so
+    for `monthly`/`annual` this is several calls, not one. What matters is
+    that the chunks are contiguous, none wider than `CHUNK_DAYS`, and
+    together cover exactly the range the README documents.
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
@@ -220,11 +225,17 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     sync_fn(engine, client, window)
 
     method = f"fetch_{endpoint}"
-    [call] = client.calls_to(method)
+    calls = sorted(client.calls_to(method), key=lambda c: c["start"])
     expected_end = date.today() - timedelta(days=1)
     expected_start = expected_end - timedelta(days=days - 1)
-    assert call["end"] == expected_end
-    assert call["start"] == expected_start
+
+    for call in calls:
+        assert (call["end"] - call["start"]).days < CHUNK_DAYS
+
+    assert calls[0]["start"] == expected_start
+    assert calls[-1]["end"] == expected_end
+    for prev, nxt in zip(calls, calls[1:]):
+        assert nxt["start"] == prev["end"] + timedelta(days=1)
 
 
 def test_search_syncers_registry_covers_every_incremental_entity():

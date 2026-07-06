@@ -7,9 +7,11 @@ detail responses must be skipped rather than crash the run.
 """
 
 from copy import deepcopy
+from datetime import timedelta
 
 from sqlalchemy import create_engine
 
+from bdns.sync.generic import CHUNK_DAYS
 from bdns.sync.syncers import sync_convocatorias
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows, last_sync_run, sync_errors_for
@@ -32,6 +34,24 @@ def test_convocatorias_cascade_progressively_reveals_older_registrations():
     assert stats["inserted"] == 1  # code 927268 (reg_days_ago=20)
     assert stats["touched"] == 2
     assert len(current_rows(engine, "convocatorias")) == 3
+
+
+def test_convocatorias_discovery_is_chunked_for_wide_windows():
+    """`monthly` (30 days) discovery must be split into <=CHUNK_DAYS-wide,
+    contiguous pieces -- a single 30-day call is exactly the range that
+    proved unreliable against the real API (see README "Limitaciones
+    conocidas").
+    """
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_convocatorias(engine, client, "monthly")
+
+    calls = sorted(client.calls_to("fetch_convocatorias_busqueda"), key=lambda c: c["start"])
+    assert len(calls) > 1
+    for call in calls:
+        assert (call["end"] - call["start"]).days < CHUNK_DAYS
+    for prev, nxt in zip(calls, calls[1:]):
+        assert nxt["start"] == prev["end"] + timedelta(days=1)
 
 
 def test_convocatorias_one_detail_call_per_discovered_code():
