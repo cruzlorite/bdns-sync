@@ -20,16 +20,16 @@ own module.
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
 from bdns.sync.generic import (
-    WINDOWS,
     iter_date_chunks,
+    resolve_when,
     sync_full_catalog,
-    sync_search_window,
+    sync_search_range,
     sync_swept_catalog,
 )
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
@@ -148,50 +148,64 @@ def sync_reglamentos(engine, client: BDNSClient) -> Dict[str, int]:
     )
 
 
-# --- big search entities (reg-date incremental, cascading windows) -------
+# --- big search entities (reg-date incremental) --------------------------
+#
+# Each takes either a cascade `window` name (the daily/weekly/monthly/annual
+# re-verification passes) or an explicit `since`/`until` range (a historical
+# backfill). `resolve_when` collapses the two into one (start, end, run_type)
+# so the engine treats a one-day window and a ten-year backfill identically.
 
 
-def sync_concesiones_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
+def sync_concesiones_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     # `fechaAlta` is the payload's own registration date, confirmed live
     # against 500+ rows across two date ranges. Passing it here lets this
-    # window detect real deletions, not just inserts and edits. See
+    # sync detect real deletions, not just inserts and edits. See
     # scd2.apply_incremental for how that comparison works.
-    return sync_search_window(
+    start, end, run_type = resolve_when(window, since, until)
+    return sync_search_range(
         engine,
         client,
         "concesiones_busqueda",
         "fetch_concesiones_busqueda",
         ("id",),
-        window,
+        start,
+        end,
+        run_type,
         reg_date_field="fechaAlta",
     )
 
 
-def sync_ayudasestado_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
-    return sync_search_window(
+def sync_ayudasestado_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+    start, end, run_type = resolve_when(window, since, until)
+    return sync_search_range(
         engine,
         client,
         "ayudasestado_busqueda",
         "fetch_ayudasestado_busqueda",
         ("idConcesion",),
-        window,
+        start,
+        end,
+        run_type,
         reg_date_field="fechaAlta",
     )
 
 
-def sync_minimis_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
-    return sync_search_window(
+def sync_minimis_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+    start, end, run_type = resolve_when(window, since, until)
+    return sync_search_range(
         engine,
         client,
         "minimis_busqueda",
         "fetch_minimis_busqueda",
         ("idConcesion",),
-        window,
+        start,
+        end,
+        run_type,
         reg_date_field="fechaRegistro",
     )
 
 
-def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
+def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     # No `reg_date_field` here. Confirmed live, using 71 rows across two
     # date ranges six months apart, that this payload never carries a
     # registration-date field. The official doc claims this endpoint
@@ -199,13 +213,16 @@ def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window: str) -> 
     # but that claim doesn't hold for this field. Window-scoped deletion
     # detection isn't possible here; this is a real, permanent limitation,
     # documented in the README.
-    return sync_search_window(
+    start, end, run_type = resolve_when(window, since, until)
+    return sync_search_range(
         engine,
         client,
         "partidospoliticos_busqueda",
         "fetch_partidospoliticos_busqueda",
         ("id",),
-        window,
+        start,
+        end,
+        run_type,
     )
 
 
@@ -260,14 +277,14 @@ def fetch_convocatoria_details(
         )
 
 
-def sync_convocatorias(engine, client: BDNSClient, window: str) -> Dict[str, int]:
-    """Two-step: discover codes for the window's reg-date-equivalent range
-    (`fechaDesde/Hasta`), then fetch full detail per code and apply
-    incrementally.
+def sync_convocatorias(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+    """Two-step: discover codes for the reg-date range (`fechaDesde/Hasta`),
+    then fetch full detail per code and apply incrementally.
+
+    Takes either a cascade `window` name or an explicit `since`/`until`
+    backfill range, same as the four `fechaReg` search entities.
     """
-    days = WINDOWS[window]
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=days - 1)
+    start, end, run_type = resolve_when(window, since, until)
     codes = discover_convocatoria_codes(client, start, end)
     errors: List[Dict[str, str]] = []
 
@@ -290,7 +307,7 @@ def sync_convocatorias(engine, client: BDNSClient, window: str) -> Dict[str, int
         stats["_skip_details"] = errors
         return stats
 
-    return run_with_bookkeeping(engine, CONVOCATORIAS_ENDPOINT, run_type=window, apply_fn=apply_fn)
+    return run_with_bookkeeping(engine, CONVOCATORIAS_ENDPOINT, run_type=run_type, apply_fn=apply_fn)
 
 
 # --- grandesbeneficiarios: two tables for one entity ----------------------

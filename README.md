@@ -25,13 +25,21 @@ export BDNS_SYNC_TARGET_URL="bigquery://proyecto/dataset"   # o postgresql://...
 bdns-sync list --kind full              # entidades de reemplazo completo
 bdns-sync list --kind search            # entidades incrementales
 bdns-sync sync sectores                 # sincroniza una entidad
-bdns-sync sync concesiones_busqueda --window daily
+bdns-sync sync concesiones_busqueda --window daily          # ventana en cascada
+bdns-sync sync concesiones_busqueda --since 2020-01-01       # backfill histórico (hasta ayer)
+bdns-sync sync concesiones_busqueda --since 2020-01-01 --until 2020-12-31
 ```
 
-Vía cron, una línea:
+Vía cron, una línea (cadencia diaria/semanal/mensual/anual):
 
 ```
 0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://proyecto/dataset /ruta/al/repo/scripts/cron_dispatch.sh
+```
+
+Carga histórica inicial (una vez, antes de arrancar el cron):
+
+```
+BDNS_SYNC_TARGET_URL=bigquery://proyecto/dataset /ruta/al/repo/scripts/full_load.sh
 ```
 
 ## Modelo de datos
@@ -105,11 +113,25 @@ El puente entre nuestra convención (inclusiva) y la familia exclusiva está en 
 - **Fiabilidad**: un rango de 4 años (27,4M filas) devuelve `ERR_MANTENIMIENTO_BBDD` de forma intermitente en cualquier profundidad de página; una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos.
 - **Velocidad**: un rango de 30 días de una sola vez tardó 286,7s; el mismo rango troceado en semanas tardó 142,5s, ambos sin errores.
 
-Como el puente de fecha se aplica por pieza, **el resultado no depende del tamaño de trozo**: un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días (comprobado en vivo).
+Como el puente de fecha se aplica por pieza, **el resultado no depende del tamaño de trozo**: un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días (comprobado en vivo). El tamaño de 7 días tampoco es crítico para la velocidad: midiendo un rango fijo de 14 días de `concesiones` (~530k filas), 1/3/7/14 días tardaron 51/41/47/57s -- diferencias dentro del ruido de carga en vivo, sin errores en ninguno. 7 días queda como equilibrio: rápido, fiable, y coincide con la ventana semanal.
 
 **4. Verificación "belt-and-suspenders" de los límites.** Para descartar tanto un solapamiento (traer un día de más) como un hueco (perder un día), se comprobó en vivo, en las 5 entidades, que dos días consecutivos `X` y `X+1` -- pedidos por la ruta real de producción con el puente correcto según familia -- cumplen: `fetch(X)` y `fetch(X+1)` son disjuntos (solape 0), y su unión es exactamente `fetch([X, X+1])`. La cuenta cuadra al registro: en `concesiones`, 115.862 + 68.457 = 184.319 filas, sin solape. Un `+1` de más (en la familia exclusiva) o un límite mal puesto (en la inclusiva) habría duplicado el día frontera; un día perdido habría roto la unión. El invariante queda fijado como test permanente (`test_generic.py`).
 
 **Detección de bajas por ventana**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda` y `convocatorias` también detectan bajas reales, comparando, dentro de la misma ejecución, lo traído contra las filas de la tabla cuya propia fecha de registro (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, según la entidad) cae en ese mismo rango. No se compara contra la ejecución anterior, porque eso daría falsos positivos constantes: toda fila envejece fuera de una ventana móvil tarde o temprano, sin que eso signifique baja. `partidospoliticos_busqueda` queda fuera: confirmado en vivo que su payload no expone ningún campo de fecha de registro, pese a que el documento oficial afirma que "funciona igual, con los mismos filtros y resultados" que `concesiones_busqueda`. No es así. Es una limitación real y permanente, salvo que la API cambie.
+
+#### Carga histórica
+
+Las ventanas en cascada solo llegan hasta 365 días atrás (`annual`). Para una carga histórica completa se usa `--since DATE [--until DATE]`, que sincroniza un rango de fechas explícito con exactamente la misma maquinaria (troceo de 7 días, puente de fecha por familia, detección de bajas acotada al rango). El tamaño de una carga completa lo marca lo que el API retiene por endpoint -- medido en vivo:
+
+| Entidad | Datos hasta ~ | Limitado por |
+|---|---|---|
+| `concesiones_busqueda` | ~4 años | retención de 4 años naturales |
+| `partidospoliticos_busqueda` | ~4 años | (sigue a concesiones) |
+| `ayudasestado_busqueda` | ~9-10 años | retención de 10 años |
+| `minimis_busqueda` | ~10 años | retención de 10 años |
+| `convocatorias` | ~12 años | arranque del portal (~2014) |
+
+Estas fechas **no** están en el código: `bdns-sync` es un primitivo puro, no sabe cuánta historia tiene cada endpoint. Igual que `cron_dispatch.sh` es dueño de la cadencia, [`scripts/full_load.sh`](scripts/full_load.sh) es dueño de las fechas de inicio y las pasa con `--since`. Pedir fechas anteriores a la retención solo devuelve semanas vacías (una llamada barata cada una), así que las fechas del script son suelos conservadores, no primeros exactos. La carga es idempotente: reejecutarla no duplica nada (SCD2 solo hace *touch* de lo ya sincronizado).
 
 ## Buenas prácticas (oficiales)
 
@@ -126,7 +148,7 @@ Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosub
 - `organos_codigo` / `organos_codigoadmin` sin implementar (grupo H).
 - `partidospoliticos_busqueda` sin detección de bajas: a diferencia de las otras 4 entidades incrementales, su payload no expone ningún campo de fecha de registro.
 - Registros individuales malformados se descartan con log (nivel WARNING), se cuentan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto + contenido truncado a 200 caracteres, enlazado por `run_id`). Nunca se guardan en las tablas sincronizadas: no tienen clave natural real, así que no se pueden versionar como una fila normal.
-- Sin backfill histórico para los 5 endpoints incrementales (`concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda`, `convocatorias`): la ventana más ancha es `annual` (365 días), pero las ayudas siguen visibles 4 años. Si se implementa, debe reusar el mismo troceo de 7 días que ya usan `monthly`/`annual` (ver arriba) -- un rango de varios años pedido de una sola vez sí falla de forma intermitente: probado en vivo (4 años, `concesiones_busqueda`, 27,4M filas), la API devuelve `ERR_MANTENIMIENTO_BBDD` en cualquier profundidad de página, mientras que una ventana semanal en el mismo rango de fechas no falló ninguna vez en 6 intentos.
+- Un rango de varios años pedido en **una sola llamada** falla de forma intermitente: probado en vivo (4 años, `concesiones_busqueda`, 27,4M filas), la API devuelve `ERR_MANTENIMIENTO_BBDD` en cualquier profundidad de página, mientras que una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos. Por eso todo se trocea a 7 días; la carga histórica (`--since`, ver [Carga histórica](#carga-histórica)) hereda ese troceo, así que no hay que pedir rangos anchos a mano.
 
 ## Desarrollo
 

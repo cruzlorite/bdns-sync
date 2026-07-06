@@ -17,6 +17,8 @@ orchestration concern that lives outside this package (see scripts/).
 """
 
 import logging
+from datetime import date
+from typing import Optional
 
 import typer
 from sqlalchemy import create_engine
@@ -78,6 +80,15 @@ TARGET_URL_OPTION = typer.Option(
 )
 
 
+def _parse_iso_date(value: Optional[str], flag: str) -> Optional[date]:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise typer.BadParameter(f"{flag} must be an ISO date (YYYY-MM-DD), got {value!r}")
+
+
 @app.command()
 def sync(
     endpoint: str = typer.Argument(..., help="Endpoint/entity name to sync."),
@@ -85,22 +96,47 @@ def sync(
     window: str = typer.Option(
         None,
         "--window",
-        help=f"Required for incremental endpoints: one of {', '.join(WINDOWS)}.",
+        help=f"Cascade window for incremental endpoints: one of {', '.join(WINDOWS)}.",
+    ),
+    since: str = typer.Option(
+        None,
+        "--since",
+        help="Backfill start date (YYYY-MM-DD) for incremental endpoints. "
+        "Overrides --window; syncs [since, until]. See scripts/full_load.sh.",
+    ),
+    until: str = typer.Option(
+        None,
+        "--until",
+        help="Backfill end date (YYYY-MM-DD). Defaults to yesterday. Only with --since.",
     ),
 ) -> None:
-    """Sync one endpoint. Incremental endpoints (the big search endpoints plus
-    convocatorias) require --window; everything else ignores it.
+    """Sync one endpoint.
+
+    Incremental endpoints (the big search endpoints plus convocatorias) need
+    a reg-date range: either a cascade `--window` (daily/weekly/monthly/annual)
+    or an explicit `--since [--until]` backfill range. Full-replace endpoints
+    ignore all of these.
     """
     engine = create_engine(target_url)
     client = BDNSClient()
 
+    since_date = _parse_iso_date(since, "--since")
+    until_date = _parse_iso_date(until, "--until")
+
     if endpoint == CONVOCATORIAS_ENDPOINT or endpoint in SEARCH_SYNCERS:
-        if window is None:
-            raise typer.BadParameter(f"{endpoint} requires --window")
-        if window not in WINDOWS:
-            raise typer.BadParameter(f"window must be one of {', '.join(WINDOWS)}")
         sync_fn = sync_convocatorias if endpoint == CONVOCATORIAS_ENDPOINT else SEARCH_SYNCERS[endpoint]
-        stats = sync_fn(engine, client, window)
+        if since_date is not None:
+            if window is not None:
+                raise typer.BadParameter("use either --window or --since, not both")
+            if until_date is not None and until_date < since_date:
+                raise typer.BadParameter("--until must not be before --since")
+            stats = sync_fn(engine, client, since=since_date, until=until_date)
+        elif window is not None:
+            if window not in WINDOWS:
+                raise typer.BadParameter(f"window must be one of {', '.join(WINDOWS)}")
+            stats = sync_fn(engine, client, window)
+        else:
+            raise typer.BadParameter(f"{endpoint} requires --window or --since")
     elif endpoint in FULL_SYNCERS:
         stats = FULL_SYNCERS[endpoint](engine, client)
     else:

@@ -271,5 +271,36 @@ def test_no_day_is_dropped_at_chunk_boundaries(endpoint, key_fields):
     assert len(current_rows(engine, endpoint)) == 30
 
 
+@pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)
+def test_backfill_since_until_range_fetches_the_whole_span(endpoint, key_fields):
+    """A `since`/`until` backfill syncs an explicit historical range instead
+    of a rolling window. Seed records across ~5 weeks and confirm a backfill
+    over that span fetches them all, chunked, and logs the run as "backfill".
+    """
+    from tests.fake_client import REG_DATE_FIELDS, reg_date
+    from tests.timeline_helpers import last_sync_run
+
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_fn = SEARCH_SYNCERS[endpoint]
+
+    records = getattr(client, endpoint)
+    records.clear()
+    reg_field = REG_DATE_FIELDS.get(endpoint)
+    for days_ago in (2, 12, 20, 33):  # spread across a multi-week span
+        payload = {key_fields[0]: 700000 + days_ago}
+        if reg_field:
+            payload[reg_field] = reg_date(days_ago).isoformat()
+        records.append({"reg_days_ago": days_ago, "payload": payload})
+
+    until = reg_date(1)  # yesterday
+    since = reg_date(40)  # 40 days back, covers all four records
+    stats = sync_fn(engine, client, since=since, until=until)
+
+    assert stats["inserted"] == 4
+    assert len(current_rows(engine, endpoint)) == 4
+    assert last_sync_run(engine, endpoint)["run_type"] == "backfill"
+
+
 def test_search_syncers_registry_covers_every_incremental_entity():
     assert set(SEARCH_SYNCERS) == {name for name, _ in INCREMENTAL_CASES}

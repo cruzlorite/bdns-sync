@@ -17,7 +17,7 @@ mechanical "fetch, then apply" plumbing lives here.
 """
 
 from datetime import date, timedelta
-from typing import Dict, Iterator, Sequence, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
@@ -129,33 +129,63 @@ def sync_swept_catalog(
     )
 
 
-def sync_search_window(
+def window_bounds(window: str) -> Tuple[date, date]:
+    """Map a cascade window name to its inclusive `[start, end]` range. `end`
+    is always yesterday (see `to_api_upper_bound` for why today is excluded).
+    """
+    days = WINDOWS[window]
+    end = date.today() - timedelta(days=1)
+    return end - timedelta(days=days - 1), end
+
+
+def resolve_when(
+    window: Optional[str], since: Optional[date], until: Optional[date]
+) -> Tuple[date, date, str]:
+    """Turn the two ways of asking for a reg-date range -- a named cascade
+    `window`, or an explicit `since`/`until` backfill range -- into a single
+    `(start, end, run_type)` triple.
+
+    An explicit `since` wins over `window` and marks the run as "backfill"
+    in `_sync_runs` (`until` defaults to yesterday). This is what lets the
+    tool stay a pure primitive: cadence and history bounds are the caller's
+    business (`scripts/`), the engine just syncs whatever range it's told.
+    """
+    if since is not None:
+        end = until if until is not None else date.today() - timedelta(days=1)
+        return since, end, "backfill"
+    if window is not None:
+        start, end = window_bounds(window)
+        return start, end, window
+    raise ValueError("a reg-date sync needs either a window or a since date")
+
+
+def sync_search_range(
     engine,
     client: BDNSClient,
     endpoint_name: str,
     fetch_method_name: str,
     key_fields: Sequence[str],
-    window: str,
+    start: date,
+    end: date,
+    run_type: str,
     reg_date_field: str = None,
 ) -> Dict[str, int]:
-    """Run one cascading re-verification window: fetch the reg-date window,
-    then apply incrementally. By default this never closes out keys, since
-    a window is a subset of the table, not the full current state.
+    """Fetch the reg-date range `[start, end]` and apply incrementally. Used
+    for both cascade windows (a few days back) and backfills (years back) --
+    same machinery, only the range and `run_type` label differ.
 
-    `reg_date_field` opts into window-scoped deletion detection (see
-    `scd2.apply_incremental`). Only entities that actually expose their own
-    registration date in the payload can use this; that was confirmed live
-    per entity, not assumed.
+    By default this never closes out keys, since a range is a subset of the
+    table, not its full current state. `reg_date_field` opts into
+    window-scoped deletion detection (see `scd2.apply_incremental`); only
+    entities that expose their own registration date can use it, confirmed
+    live per entity.
 
-    The fetch itself is chunked into `CHUNK_DAYS`-wide pieces (see there for
-    why); `window_start`/`window_end` passed to `apply_incremental` still
-    cover the full requested window, since deletion scoping cares about the
-    whole window, not how it was split up to fetch it.
+    The fetch is chunked into `CHUNK_DAYS`-wide pieces (see `iter_date_chunks`
+    and `to_api_upper_bound`). `window_start`/`window_end` given to
+    `apply_incremental` still span the whole `[start, end]`, since deletion
+    scoping cares about the full range, not how it was split to fetch it.
     """
     fetch = getattr(client, fetch_method_name)
-    days = WINDOWS[window]
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=days - 1)
 
     def rows():
         for chunk_start, chunk_end in iter_date_chunks(start, end):
@@ -166,7 +196,7 @@ def sync_search_window(
     return run_with_bookkeeping(
         engine,
         endpoint_name,
-        run_type=window,
+        run_type=run_type,
         apply_fn=lambda conn, table, staging: apply_incremental(
             conn,
             table,

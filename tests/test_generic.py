@@ -5,10 +5,12 @@ from sqlalchemy import MetaData, create_engine, select
 
 from bdns.sync.generic import (
     iter_date_chunks,
+    resolve_when,
     sync_full_catalog,
-    sync_search_window,
+    sync_search_range,
     sync_swept_catalog,
     to_api_upper_bound,
+    window_bounds,
 )
 from bdns.sync.schema import build_control_tables, build_sync_table
 from tests.fake_client import FakeBDNSClient, reg_date
@@ -250,40 +252,89 @@ def test_swept_catalog_does_not_close_other_sweep_values_as_missing():
     assert len(current_rows(engine, "widgets")) == 2
 
 
-# --- sync_search_window ----------------------------------------------------
+# --- window_bounds / resolve_when ------------------------------------------
+
+
+def test_window_bounds_span_the_declared_days_ending_yesterday():
+    yesterday = date.today() - timedelta(days=1)
+    assert window_bounds("daily") == (yesterday, yesterday)
+    assert window_bounds("weekly") == (yesterday - timedelta(days=6), yesterday)
+    assert window_bounds("annual") == (yesterday - timedelta(days=364), yesterday)
+
+
+def test_window_bounds_rejects_unknown_window():
+    with pytest.raises(KeyError):
+        window_bounds("bogus")
+
+
+def test_resolve_when_from_window_name():
+    yesterday = date.today() - timedelta(days=1)
+    assert resolve_when("daily", None, None) == (yesterday, yesterday, "daily")
+
+
+def test_resolve_when_since_overrides_window_and_defaults_until_to_yesterday():
+    yesterday = date.today() - timedelta(days=1)
+    start, end, run_type = resolve_when("daily", date(2020, 1, 1), None)
+    assert (start, end, run_type) == (date(2020, 1, 1), yesterday, "backfill")
+
+
+def test_resolve_when_explicit_since_and_until():
+    assert resolve_when(None, date(2020, 1, 1), date(2020, 6, 30)) == (
+        date(2020, 1, 1),
+        date(2020, 6, 30),
+        "backfill",
+    )
+
+
+def test_resolve_when_needs_window_or_since():
+    with pytest.raises(ValueError):
+        resolve_when(None, None, None)
+
+
+# --- sync_search_range ------------------------------------------------------
 
 
 class FakeSearchClient:
     def __init__(self, rows):
         self._rows = rows
+        self.calls = []
 
     def fetch_widgets_busqueda(self, fechaRegInicio=None, fechaRegFin=None):
+        self.calls.append((fechaRegInicio, fechaRegFin))
         self.last_window = (fechaRegInicio, fechaRegFin)
         yield from self._rows
 
 
-def test_search_window_incremental_no_deletion_detection():
+def test_search_range_incremental_no_deletion_detection():
     engine = create_engine("sqlite:///:memory:")
     client = FakeSearchClient([{"id": 1}, {"id": 2}])
-    sync_search_window(engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), "daily")
+    start, end = date(2024, 1, 1), date(2024, 1, 1)
+    sync_search_range(
+        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
+    )
 
     client._rows = [{"id": 1}]
-    stats = sync_search_window(
-        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), "daily"
+    stats = sync_search_range(
+        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
     )
     assert stats == {"fetched": 1, "inserted": 0, "updated": 0, "touched": 1}
 
-    # daily covers just yesterday, but the API upper bound is exclusive, so
-    # fechaRegFin is sent as today (yesterday + 1) to include yesterday's day
-    yesterday = date.today() - timedelta(days=1)
-    assert client.last_window == (yesterday, date.today())
+    # single-day range, upper bound sent exclusive (start + 1)
+    assert client.last_window == (start, end + timedelta(days=1))
     assert len(current_rows(engine, "widgets_busqueda")) == 2  # id=2 not closed
 
 
-def test_search_window_rejects_unknown_window():
+def test_search_range_backfill_chunks_a_multi_week_span_by_7_days():
     engine = create_engine("sqlite:///:memory:")
     client = FakeSearchClient([])
-    with pytest.raises(KeyError):
-        sync_search_window(
-            engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), "bogus"
-        )
+    start, end = date(2020, 1, 1), date(2020, 1, 31)  # 31 days -> 5 weekly chunks
+    sync_search_range(
+        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "backfill"
+    )
+
+    calls = sorted(client.calls)
+    assert len(calls) == 5
+    assert calls[0][0] == start
+    assert calls[-1][1] == end + timedelta(days=1)  # last exclusive upper bound
+    for lo, hi in calls:
+        assert (hi - lo).days <= 7  # each chunk at most a week (exclusive end)

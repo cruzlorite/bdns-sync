@@ -27,13 +27,21 @@ export BDNS_SYNC_TARGET_URL="bigquery://project/dataset"   # or postgresql://...
 bdns-sync list --kind full              # full-replace entities
 bdns-sync list --kind search            # incremental entities
 bdns-sync sync sectores                 # sync one entity
-bdns-sync sync concesiones_busqueda --window daily
+bdns-sync sync concesiones_busqueda --window daily           # cascade window
+bdns-sync sync concesiones_busqueda --since 2020-01-01        # historical backfill (through yesterday)
+bdns-sync sync concesiones_busqueda --since 2020-01-01 --until 2020-12-31
 ```
 
-Via cron, one line:
+Via cron, one line (daily/weekly/monthly/annual cadence):
 
 ```
 0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/repo/scripts/cron_dispatch.sh
+```
+
+Initial historical load (once, before starting the cron):
+
+```
+BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/repo/scripts/full_load.sh
 ```
 
 ## Data model
@@ -107,11 +115,25 @@ The bridge from our inclusive convention to the exclusive family lives in one na
 - **Reliability**: a 4-year range (27.4M rows) returns `ERR_MANTENIMIENTO_BBDD` intermittently at any page depth; a one-week window over the same dates didn't fail once in 6 tries.
 - **Speed**: a single 30-day call took 286.7s; the same range chunked into weeks took 142.5s, both with zero errors.
 
-Because the date bridge is applied per piece, **the result doesn't depend on chunk size**: a 14-day `partidospoliticos_busqueda` range returns exactly the same 36 rows chunked into 1-, 7-, or 14-day pieces (confirmed live).
+Because the date bridge is applied per piece, **the result doesn't depend on chunk size**: a 14-day `partidospoliticos_busqueda` range returns exactly the same 36 rows chunked into 1-, 7-, or 14-day pieces (confirmed live). The 7-day size isn't speed-critical either: measuring a fixed 14-day `concesiones` range (~530k rows), 1/3/7/14-day chunks took 51/41/47/57s -- differences within live-load noise, zero errors at any size. 7 days is the balance kept: fast, reliable, and it lines up with the weekly window.
 
 **4. Belt-and-suspenders check of the boundaries.** To rule out both an overlap (fetching one day too many) and a gap (dropping a day), it was confirmed live, across all 5 entities, that two adjacent days `X` and `X+1` -- fetched through the real production path with the correct per-family bridge -- satisfy: `fetch(X)` and `fetch(X+1)` are disjoint (zero overlap), and their union is exactly `fetch([X, X+1])`. The counts add up to the row: for `concesiones`, 115,862 + 68,457 = 184,319 rows, no overlap. One extra `+1` (on the exclusive family) or a wrong bound (on the inclusive one) would have double-counted the boundary day; a dropped day would have broken the union. The invariant is locked in as a permanent test (`test_generic.py`).
 
 **Window-scoped deletion detection**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, and `convocatorias` also detect real deletions, by comparing, within the same run, what was fetched against the table rows whose own registration date (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, depending on the entity) falls in that same range. This is never compared against the previous run, since that would produce constant false positives: every row eventually ages out of a rolling window regardless of deletion. `partidospoliticos_busqueda` is excluded: confirmed live that its payload never exposes a registration-date field, despite the official doc claiming it "works the same, same filters and results" as `concesiones_busqueda`. It doesn't. This is a real, permanent limitation unless the API changes.
+
+#### Historical load
+
+The cascade windows only reach 365 days back (`annual`). For a full historical load, use `--since DATE [--until DATE]`, which syncs an explicit date range through exactly the same machinery (7-day chunking, per-family date bridge, deletion detection scoped to the range). How far back a full load goes is set by what the API retains per endpoint -- measured live:
+
+| Entity | Data goes back | Bounded by |
+|---|---|---|
+| `concesiones_busqueda` | ~4 years | 4 calendar-year retention |
+| `partidospoliticos_busqueda` | ~4 years | (tracks concesiones) |
+| `ayudasestado_busqueda` | ~9-10 years | 10-year retention |
+| `minimis_busqueda` | ~10 years | 10-year retention |
+| `convocatorias` | ~12 years | portal start (~2014) |
+
+These dates are **not** in the code: `bdns-sync` is a pure primitive, it doesn't know how much history each endpoint has. Just as `cron_dispatch.sh` owns the cadence, [`scripts/full_load.sh`](scripts/full_load.sh) owns the start dates and passes them via `--since`. Asking for dates before the retention just returns empty weeks (one cheap call each), so the script's dates are conservative floors, not exact firsts. The load is idempotent: re-running it duplicates nothing (SCD2 just touches already-synced records).
 
 ## Good practices followed (official)
 
@@ -128,7 +150,7 @@ Per the official ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.e
 - `organos_codigo` / `organos_codigoadmin` not implemented (group H).
 - `partidospoliticos_busqueda` has no deletion detection: unlike the other 4 incremental entities, its payload never exposes a registration-date field (confirmed live with 70+ real rows across two different date ranges).
 - Individual malformed records are skipped with a log (WARNING level), counted in `_sync_runs.rows_skipped`, and recorded in `_sync_errors` (context plus content truncated to 200 characters, linked by `run_id`). They're never stored in the synced tables: a malformed record has no real natural key, so it can't be versioned like a normal row.
-- No historical backfill for the 5 incremental endpoints (`concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda`, `convocatorias`): the widest window is `annual` (365 days), but grants stay visible for 4 years. If this ever gets built, it should reuse the same 7-day chunking `monthly`/`annual` already use (see above): a multi-year range requested in one call does fail intermittently, tested live (4 years, `concesiones_busqueda`, 27.4M rows) the API returns `ERR_MANTENIMIENTO_BBDD` at any page depth, while a one-week window over the same dates didn't fail once in 6 tries.
+- A multi-year range requested in **one call** fails intermittently: tested live (4 years, `concesiones_busqueda`, 27.4M rows), the API returns `ERR_MANTENIMIENTO_BBDD` at any page depth, while a one-week window over the same dates didn't fail once in 6 tries. That's why everything is chunked to 7 days; the historical load (`--since`, see [Historical load](#historical-load)) inherits that chunking, so there's no need to request wide ranges by hand.
 
 ## Development
 
