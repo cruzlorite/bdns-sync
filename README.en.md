@@ -38,11 +38,26 @@ Via cron, one line:
 
 ## Data model
 
-Every table shares the same generic schema -- no per-endpoint fields:
+Each synced endpoint has its own table, and they all share the same generic schema -- no per-endpoint fields. The original record goes into `payload` whole; everything else is SCD2 control columns:
 
-`_natural_key` · `_row_hash` · `_valid_from` / `_valid_to` · `_is_current` · `payload` (JSON, full record)
+| Column | What for |
+|---|---|
+| `_id` | Autoincrement PK, internal only |
+| `_natural_key` | The record's business key (JSON of the key fields; see the entity tables below) |
+| `_row_hash` | SHA-256 of the canonical payload, so a change is detected without comparing field by field |
+| `_valid_from` / `_valid_to` | This version's validity span. `_valid_to` is `NULL` while it's the current version |
+| `_is_current` | `True` on the live version of each natural key |
+| `_synced_at` | Last time this version was seen at the source (bumped even when nothing changed) |
+| `_reg_date` | The payload's own registration date. Only populated for entities with window-scoped deletion detection (see below); `NULL` for the rest |
+| `payload` | JSON with the full record exactly as the API returns it |
 
 If the API adds or drops a field, no migration needed: caught by hash, versioned like any other change.
+
+**Control tables** (shared across all endpoints, `_sync_` prefix):
+
+- **`_sync_state`** -- one row per table, the watermark: `table_name`, `last_synced_at`, `last_run_id`.
+- **`_sync_runs`** -- append-only log of every run: `run_id`, `table_name`, `run_type` (`full` or `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, and the counters `rows_fetched`, `rows_inserted`, `rows_soft_deleted`, `rows_skipped`.
+- **`_sync_errors`** -- one row per skipped malformed record: `error_id`, `run_id`, `table_name`, `context`, `content` (truncated to 200 chars), `occurred_at`. See [Known limitations](#known-limitations).
 
 ## Endpoint types
 

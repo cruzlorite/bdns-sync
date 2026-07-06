@@ -36,11 +36,26 @@ Vía cron, una línea:
 
 ## Modelo de datos
 
-Todas las tablas comparten el mismo esquema genérico -- sin campos por endpoint:
+Cada endpoint sincronizado tiene su propia tabla, y todas comparten el mismo esquema genérico -- sin campos por endpoint. El registro original entra entero en `payload`; el resto son columnas de control SCD2:
 
-`_natural_key` · `_row_hash` · `_valid_from` / `_valid_to` · `_is_current` · `payload` (JSON con el registro completo)
+| Columna | Para qué |
+|---|---|
+| `_id` | PK autoincremental, solo interna |
+| `_natural_key` | Clave de negocio del registro (JSON de los campos clave; ver tabla de entidades más abajo) |
+| `_row_hash` | SHA-256 del payload canónico; así se detecta un cambio sin comparar campo a campo |
+| `_valid_from` / `_valid_to` | Vigencia de esta versión. `_valid_to` es `NULL` mientras es la versión actual |
+| `_is_current` | `True` en la versión vigente de cada clave natural |
+| `_synced_at` | Última vez que esta versión se vio en el origen (se actualiza aunque no cambie) |
+| `_reg_date` | Fecha de registro propia del payload. Solo se rellena en las entidades con detección de bajas por ventana (ver más abajo); en el resto queda `NULL` |
+| `payload` | JSON con el registro completo tal cual lo devuelve la API |
 
 Si la API añade o quita un campo, no hace falta migración: se detecta por hash y se versiona como cualquier otro cambio.
+
+**Tablas de control** (compartidas por todos los endpoints, prefijo `_sync_`):
+
+- **`_sync_state`** -- una fila por tabla, la marca de agua: `table_name`, `last_synced_at`, `last_run_id`.
+- **`_sync_runs`** -- registro append-only de cada ejecución: `run_id`, `table_name`, `run_type` (`full` o `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, y los contadores `rows_fetched`, `rows_inserted`, `rows_soft_deleted`, `rows_skipped`.
+- **`_sync_errors`** -- una fila por registro malformado descartado: `error_id`, `run_id`, `table_name`, `context`, `content` (truncado a 200 caracteres), `occurred_at`. Ver [Limitaciones conocidas](#limitaciones-conocidas).
 
 ## Tipos de endpoint
 
