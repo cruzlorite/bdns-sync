@@ -2,20 +2,21 @@
 scenario tests instead of hitting the network.
 
 `bdns.sync.syncers` never imports or type-checks against the real
-`BDNSClient` class -- every `sync_*` function just calls `fetch_*` methods
-on whatever `client` object it's given. That means a plain Python object
-exposing the same method names/kwargs is a complete substitute, no mocking
-library required.
+`BDNSClient` class. Every `sync_*` function just calls `fetch_*` methods on
+whatever `client` object it's given, so a plain Python object exposing the
+same method names and keyword arguments is a complete substitute. No
+mocking library is required.
 
 Backing data is loaded from tests/fixtures/*.json: real records captured
-live from the BDNS API with names, NIF/CIF, and other identifying values
-replaced by fake ones (see tests/fixtures/README.md). Fields are otherwise
-untouched, so the tests exercise the real payload shape.
+live from the BDNS API, with names, NIF/CIF, and other identifying values
+replaced by fake ones. Fields are otherwise untouched, so the tests
+exercise the real payload shape.
 
-Each fixture list/dict is copied onto `self` at construction time and is
-meant to be mutated directly between simulated "days" in a test
-(`client.concesiones_busqueda.append(...)`, `del client.sectores[0]`, editing
-a field on one row, ...) to script insert/update/touch/delete scenarios.
+Each fixture list or dict is copied onto `self` at construction time and is
+meant to be mutated directly between simulated "days" in a test, for
+example `client.concesiones_busqueda.append(...)`, `del client.sectores[0]`,
+or editing a field on one row, to script insert/update/touch/delete
+scenarios.
 """
 
 import json
@@ -39,19 +40,39 @@ def load_fixture(name: str):
     return deepcopy(_CACHE[name])
 
 
+# Maps each entity to the payload field that holds its own registration
+# date, confirmed live against the real API (see bdns/sync/syncers.py).
+# Fixture records store an offset (`reg_days_ago`) instead of this field's
+# value, so it has to be patched in dynamically. Otherwise it would be
+# whatever absolute date was true when the fixture was captured, which
+# would break window-scoped deletion checks as soon as time passes.
+REG_DATE_FIELDS = {
+    "concesiones_busqueda": "fechaAlta",
+    "ayudasestado_busqueda": "fechaAlta",
+    "minimis_busqueda": "fechaRegistro",
+    "convocatorias_busqueda": "fechaRecepcion",
+}
+
+
+def _patch_reg_dates(records: List[dict], field: str) -> None:
+    for rec in records:
+        rec["payload"][field] = reg_date(rec["reg_days_ago"]).isoformat()
+
+
 def reg_date(days_ago: int) -> date:
-    """Fixtures store ages in days-ago (not absolute dates) so they never go
-    stale. Relative to *yesterday*, not today: every window (daily included)
-    ends at `date.today() - 1` (see bdns.sync.generic.WINDOWS), since data
-    for "today" isn't final until the run the following morning. So
-    `days_ago=0` means "yesterday" -- always inside the daily window.
+    """Fixtures store ages in days-ago rather than absolute dates, so they
+    never go stale. This is relative to yesterday, not today: every window,
+    daily included, ends at `date.today() - 1` (see bdns.sync.generic.WINDOWS),
+    since data for "today" isn't final until the run the following morning.
+    So `days_ago=0` means "yesterday", which is always inside the daily
+    window.
     """
     return date.today() - timedelta(days=1) - timedelta(days=days_ago)
 
 
 class FakeBDNSClient:
     def __init__(self):
-        # simple full-replace catalogs
+        # Simple full-replace catalogs.
         self.sectores = load_fixture("sectores")
         self.actividades = load_fixture("actividades")
         self.finalidades = load_fixture("finalidades")
@@ -62,25 +83,38 @@ class FakeBDNSClient:
         self.regiones = load_fixture("regiones")
         self.sanciones_busqueda = load_fixture("sanciones_busqueda")
 
-        # swept catalogs: sweep value -> rows. Only "C" is populated from the
-        # real capture (that's the sample we pulled); other admin types /
-        # ambitos are legitimately empty for most real organs too, and the
-        # merge-without-cross-closing behaviour is what's under test, not
+        # Swept catalogs: sweep value -> rows. Only "C" is populated, since
+        # that's the sample pulled from the real capture. Other admin types
+        # and ambitos are legitimately empty for most real organs too, and
+        # what's under test is the merge-without-cross-closing behavior, not
         # the exact row count per value.
         self.organos = {"C": load_fixture("organos"), "A": [], "L": [], "O": []}
         self.organos_agrupacion = {"C": load_fixture("organos_agrupacion"), "A": [], "L": [], "O": []}
         self.reglamentos = {"C": load_fixture("reglamentos"), "A": [], "M": [], "S": [], "P": [], "G": []}
 
-        # windowed search entities: [{"reg_days_ago": int, "payload": {...}}]
+        # Windowed search entities: [{"reg_days_ago": int, "payload": {...}}].
+        # partidospoliticos_busqueda has no registration-date field in its
+        # payload, confirmed live, so there's nothing to patch there.
         self.concesiones_busqueda = load_fixture("concesiones_busqueda")
+        _patch_reg_dates(self.concesiones_busqueda, REG_DATE_FIELDS["concesiones_busqueda"])
         self.ayudasestado_busqueda = load_fixture("ayudasestado_busqueda")
+        _patch_reg_dates(self.ayudasestado_busqueda, REG_DATE_FIELDS["ayudasestado_busqueda"])
         self.minimis_busqueda = load_fixture("minimis_busqueda")
+        _patch_reg_dates(self.minimis_busqueda, REG_DATE_FIELDS["minimis_busqueda"])
         self.partidospoliticos_busqueda = load_fixture("partidospoliticos_busqueda")
         self.convocatorias_busqueda = load_fixture("convocatorias_busqueda")
+        _patch_reg_dates(self.convocatorias_busqueda, REG_DATE_FIELDS["convocatorias_busqueda"])
 
-        # numeroConvocatoria/idPES -> detail payload (or a non-dict to
-        # simulate the live "malformed record" case _skip_malformed guards)
+        # numeroConvocatoria/idPES -> detail payload (or a non-dict, to
+        # simulate the live "malformed record" case _skip_malformed guards
+        # against). Keep each detail's fechaRecepcion in sync with its
+        # discovery entry's freshly patched date, since they're the same
+        # record.
         self.convocatorias_detail = load_fixture("convocatorias_detail")
+        for rec in self.convocatorias_busqueda:
+            detail = self.convocatorias_detail.get(rec["payload"]["numeroConvocatoria"])
+            if isinstance(detail, dict):
+                detail["fechaRecepcion"] = rec["payload"]["fechaRecepcion"]
 
         self.grandesbeneficiarios_anios = load_fixture("grandesbeneficiarios_anios")
         self.grandesbeneficiarios_busqueda = load_fixture("grandesbeneficiarios_busqueda")
@@ -91,7 +125,7 @@ class FakeBDNSClient:
 
         self.calls: List[tuple] = []  # (method_name, kwargs) audit log
 
-    # --- simple full-replace catalogs (no args) -------------------------
+    # Simple full-replace catalogs, no arguments.
 
     def fetch_sectores(self):
         yield from self.sectores
@@ -120,7 +154,7 @@ class FakeBDNSClient:
     def fetch_sanciones_busqueda(self):
         yield from self.sanciones_busqueda
 
-    # --- swept catalogs ---------------------------------------------------
+    # Swept catalogs.
 
     def fetch_organos(self, idAdmon):
         self.calls.append(("fetch_organos", {"idAdmon": idAdmon}))
@@ -134,7 +168,7 @@ class FakeBDNSClient:
         self.calls.append(("fetch_reglamentos", {"ambito": ambito}))
         yield from self.reglamentos.get(ambito, [])
 
-    # --- windowed search entities (reg-date cascade) ----------------------
+    # Windowed search entities (reg-date cascade).
 
     def _windowed(self, method: str, records: Iterable[dict], start: date, end: date):
         self.calls.append((method, {"start": start, "end": end}))
@@ -167,7 +201,7 @@ class FakeBDNSClient:
             "fetch_convocatorias_busqueda", self.convocatorias_busqueda, fechaDesde, fechaHasta
         )
 
-    # --- discover-then-detail ----------------------------------------------
+    # Discover-then-detail.
 
     def fetch_convocatorias(self, numConv):
         self.calls.append(("fetch_convocatorias", {"numConv": numConv}))
@@ -176,7 +210,7 @@ class FakeBDNSClient:
             return
         yield detail
 
-    # --- grandesbeneficiarios: dynamic anios sweep --------------------------
+    # grandesbeneficiarios: dynamic anios sweep.
 
     def fetch_grandesbeneficiarios_anios(self):
         yield from self.grandesbeneficiarios_anios
@@ -187,7 +221,7 @@ class FakeBDNSClient:
             if rec["ejercicio"] in anios:
                 yield rec
 
-    # --- planesestrategicos: discovery + detail + vigencia ------------------
+    # planesestrategicos: discovery, detail, and vigencia.
 
     def fetch_planesestrategicos_busqueda(self):
         yield from self.planesestrategicos_busqueda
@@ -206,7 +240,7 @@ class FakeBDNSClient:
             return
         yield vig
 
-    # --- test helpers --------------------------------------------------
+    # Test helpers.
 
     def calls_to(self, method: str) -> List[dict]:
         return [kwargs for name, kwargs in self.calls if name == method]

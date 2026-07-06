@@ -1,6 +1,6 @@
 """Cheap smoke test across every registered sync function: catches typos in
 endpoint names, broken imports, or a sync function not actually being
-callable -- without needing one dedicated test per one-liner wrapper.
+callable, without needing one dedicated test per one-liner wrapper.
 """
 
 from bdns.sync.syncers import (

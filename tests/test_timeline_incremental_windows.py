@@ -1,19 +1,29 @@
 """Multi-day scenarios for the reg-date incremental "big search" endpoints:
-concesiones_busqueda, ayudasestado_busqueda, minimis_busqueda,
-partidospoliticos_busqueda -- run through every cascade window
+concesiones_busqueda, ayudasestado_busqueda, minimis_busqueda, and
+partidospoliticos_busqueda. Runs through every cascade window
 (daily/weekly/monthly/annual).
 
-The interesting behaviour here isn't insert/touch/rewrite in isolation
-(covered generically in test_scd2.py) -- it's the *cascade*: daily only
+The interesting behavior here isn't insert/touch/rewrite in isolation,
+which is covered generically in test_scd2.py. It's the cascade: daily only
 looks at yesterday, so a correction to a record registered 20 days ago is
 invisible to daily and weekly, and only a monthly (or annual) pass catches
 it. That's the whole reason the official BDNS guidance recommends running
 all four cadences instead of just daily, and it's what these tests prove
 end to end against real-shaped payloads.
 
+It's also where window-scoped deletion detection is exercised end to end
+(the unit-level proof lives in test_scd2.py). concesiones_busqueda,
+ayudasestado_busqueda, and minimis_busqueda each expose their own
+registration-date field in the payload, confirmed live against the real
+API, so they detect a real deletion the moment it falls inside the
+currently-run window. partidospoliticos_busqueda doesn't expose that field
+(also confirmed live, despite the official doc claiming otherwise), so it
+never detects deletions, same as before this feature existed.
+
 Each fixture record carries `reg_days_ago` (see tests/fake_client.py):
-0 -> inside daily; 5 -> inside weekly, outside daily; 20 -> inside monthly,
-outside weekly; 100 -> inside annual, outside monthly.
+0 means inside daily; 5 means inside weekly but outside daily; 20 means
+inside monthly but outside weekly; 100 means inside annual but outside
+monthly.
 """
 
 from copy import deepcopy
@@ -27,8 +37,8 @@ from bdns.sync.syncers import SEARCH_SYNCERS
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows
 
-# (endpoint name, key fields) -- endpoint name doubles as the fixture file
-# name, the client attribute, and the sync table name.
+# (endpoint name, key fields). The endpoint name doubles as the fixture
+# file name, the client attribute, and the sync table name.
 INCREMENTAL_CASES = [
     ("concesiones_busqueda", ("id",)),
     ("ayudasestado_busqueda", ("idConcesion",)),
@@ -37,6 +47,15 @@ INCREMENTAL_CASES = [
 ]
 
 CASE_IDS = [name for name, _ in INCREMENTAL_CASES]
+
+# Only these expose their own registration-date field in the payload, so
+# window-scoped deletion detection is only possible for them.
+SCOPED_DELETION_CASES = [
+    ("concesiones_busqueda", ("id",)),
+    ("ayudasestado_busqueda", ("idConcesion",)),
+    ("minimis_busqueda", ("idConcesion",)),
+]
+SCOPED_CASE_IDS = [name for name, _ in SCOPED_DELETION_CASES]
 
 
 @pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)
@@ -96,33 +115,74 @@ def test_daily_and_weekly_miss_a_correction_only_monthly_catches(endpoint, key_f
     assert stats.get("updated", 0) == 0  # still can't see it, 20 > 7
 
     stats = sync_fn(engine, client, "monthly")
-    assert stats["updated"] == 1  # 20 <= 30 -- caught
+    assert stats["updated"] == 1  # 20 <= 30, caught
 
     current = current_rows(engine, endpoint)
     updated_row = next(r for r in current if r["payload"].get(payload_field) == "__CORRECTED__")
     assert updated_row is not None
 
 
-@pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)
-def test_incremental_never_reports_or_applies_deletions(endpoint, key_fields):
-    """A reg-date window is a subset of the table, not the full current
-    state -- a record missing from one window's fetch must never be closed
-    out. (Deletion detection is reserved for full-reconciliation passes,
-    which these entities don't get -- see README "Limitaciones conocidas".)
+def test_partidospoliticos_never_reports_or_applies_deletions():
+    """No registration-date field in this payload (confirmed live) -> no
+    window-scoped deletion detection possible. A record missing from a
+    window's fetch is never closed, same as before this feature existed.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_fn = SEARCH_SYNCERS["partidospoliticos_busqueda"]
+    for window in ("daily", "weekly", "monthly", "annual"):
+        sync_fn(engine, client, window)
+    before = len(current_rows(engine, "partidospoliticos_busqueda"))
+
+    records = client.partidospoliticos_busqueda
+    records.remove(next(r for r in records if r["reg_days_ago"] == 0))
+
+    stats = sync_fn(engine, client, "daily")
+    assert "soft_deleted" not in stats
+    assert len(current_rows(engine, "partidospoliticos_busqueda")) == before
+
+
+@pytest.mark.parametrize("endpoint,key_fields", SCOPED_DELETION_CASES, ids=SCOPED_CASE_IDS)
+def test_scoped_entities_detect_a_real_deletion_within_the_current_window(endpoint, key_fields):
+    """`fechaAlta`/`fechaRegistro` (the payload's own registration date) is
+    inside `[window_start, window_end]` for the reg_days_ago=0 record on
+    every daily run. So if it's genuinely missing from today's fetch, that's
+    a real deletion, not aging, and must be closed.
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
-    for window in ("daily", "weekly", "monthly", "annual"):
-        sync_fn(engine, client, window)
+    sync_fn(engine, client, "daily")
     before = len(current_rows(engine, endpoint))
 
     records = getattr(client, endpoint)
     records.remove(next(r for r in records if r["reg_days_ago"] == 0))
 
     stats = sync_fn(engine, client, "daily")
-    assert "closed" not in stats
-    assert len(current_rows(engine, endpoint)) == before  # nothing closed
+    assert stats["soft_deleted"] == 1
+    assert len(current_rows(engine, endpoint)) == before - 1
+
+
+@pytest.mark.parametrize("endpoint,key_fields", SCOPED_DELETION_CASES, ids=SCOPED_CASE_IDS)
+def test_scoped_entities_ignore_records_outside_the_current_window(endpoint, key_fields):
+    """The reg_days_ago=20 record's own registration date isn't inside
+    daily's [yesterday, yesterday] range. So even though it's genuinely
+    missing from today's daily fetch, it was never in scope to begin with,
+    and window-scoped deletion must leave it alone. This is the case a
+    naive "missing from this run's fetch" diff would have gotten wrong.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_fn = SEARCH_SYNCERS[endpoint]
+    sync_fn(engine, client, "monthly")  # seeds reg_days_ago 0, 5, 20
+    before = len(current_rows(engine, endpoint))
+
+    records = getattr(client, endpoint)
+    records.remove(next(r for r in records if r["reg_days_ago"] == 20))
+
+    stats = sync_fn(engine, client, "daily")  # only covers reg_days_ago=0
+    assert stats.get("soft_deleted", 0) == 0
+    assert len(current_rows(engine, endpoint)) == before
 
 
 @pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)
@@ -151,8 +211,8 @@ def test_new_registration_is_caught_by_the_next_daily_run(endpoint, key_fields):
 def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, window, days):
     """`--window daily/weekly/monthly/annual` must translate into the exact
     reg-date range the README documents: ending yesterday, spanning `days`
-    days back -- this is the "does the CLI option actually change API
-    request behaviour" check.
+    days back. This is the "does the CLI option actually change API request
+    behavior" check.
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()

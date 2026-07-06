@@ -11,16 +11,15 @@
 # You should have received a copy of the GNU General Public License along
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Main entry point for the BDNS Sync command line interface."""
+"""Main entry point for the BDNS Sync command line interface.
 
-import logging
+Also what the installed `bdns-sync` console script points to
+(`pyproject.toml`). It imports `app` directly rather than running this
+module as `__main__`, so logging setup lives in `cli.py`'s callback
+instead of here (see its docstring).
+"""
 
 from bdns.sync.cli import app
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        force=True,
-    )
     app()

@@ -28,14 +28,14 @@ from bdns.sync.schema import build_control_tables, build_staging_table, build_sy
 def run_with_bookkeeping(
     engine: Engine, endpoint_name: str, run_type: str, apply_fn: Callable
 ) -> Dict[str, int]:
-    """`run_type` is a classification label for `_sync_runs` -- either "full"
+    """`run_type` is a classification label for `_sync_runs`: either "full"
     (full-catalog/swept/discover-then-detail syncs) or a reg-date window name
     (daily/weekly/monthly/annual, for the incremental syncs).
     """
     metadata = MetaData()
     table = build_sync_table(endpoint_name, metadata)
     staging = build_staging_table(endpoint_name, metadata)
-    sync_state, sync_runs = build_control_tables(metadata)
+    sync_state, sync_runs, sync_errors = build_control_tables(metadata)
     metadata.create_all(engine, checkfirst=True)
 
     started_at = datetime.now(timezone.utc)
@@ -49,7 +49,7 @@ def run_with_bookkeeping(
                 status="running",
                 rows_fetched=0,
                 rows_inserted=0,
-                rows_closed=0,
+                rows_soft_deleted=0,
             )
         ).inserted_primary_key[0]
 
@@ -68,6 +68,7 @@ def run_with_bookkeeping(
             raise
 
         finished_at = datetime.now(timezone.utc)
+        skip_details = stats.pop("_skip_details", [])
         conn.execute(
             update(sync_runs)
             .where(sync_runs.c.run_id == run_id)
@@ -76,9 +77,24 @@ def run_with_bookkeeping(
                 status="success",
                 rows_fetched=stats["fetched"],
                 rows_inserted=stats["inserted"] + stats["updated"],
-                rows_closed=stats.get("closed", 0),
+                rows_soft_deleted=stats.get("soft_deleted", 0),
+                rows_skipped=stats.get("skipped", 0),
             )
         )
+        if skip_details:
+            conn.execute(
+                insert(sync_errors),
+                [
+                    {
+                        "run_id": run_id,
+                        "table_name": endpoint_name,
+                        "context": detail["context"],
+                        "content": detail["content"],
+                        "occurred_at": finished_at,
+                    }
+                    for detail in skip_details
+                ],
+            )
         _upsert_sync_state(conn, sync_state, endpoint_name, finished_at, run_id)
 
     return stats

@@ -32,10 +32,10 @@ def test_full_catalog_writes_rows_and_run_log():
     client = FakeFullClient([{"id": 1, "v": "a"}, {"id": 2, "v": "b"}])
 
     stats = sync_full_catalog(engine, client, "widgets", "fetch_widgets", ("id",))
-    assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0, "closed": 0}
+    assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0, "soft_deleted": 0}
 
     metadata = MetaData()
-    sync_state, sync_runs = build_control_tables(metadata)
+    sync_state, sync_runs, _ = build_control_tables(metadata)
     with engine.begin() as conn:
         assert len(current_rows(engine, "widgets")) == 2
         state_row = conn.execute(
@@ -53,7 +53,7 @@ def test_full_catalog_second_run_detects_deletion():
 
     client._rows = [{"id": 1}]
     stats = sync_full_catalog(engine, client, "widgets", "fetch_widgets", ("id",))
-    assert stats["closed"] == 1
+    assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, "widgets")) == 1
 
 
@@ -94,7 +94,7 @@ def test_swept_catalog_does_not_close_other_sweep_values_as_missing():
     stats = sync_swept_catalog(
         engine, client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
     )
-    assert stats["closed"] == 0
+    assert stats["soft_deleted"] == 0
     assert len(current_rows(engine, "widgets")) == 2
 
 

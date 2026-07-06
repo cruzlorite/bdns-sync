@@ -16,6 +16,8 @@ config file, no cadence knowledge. Which endpoints to sync and when is an
 orchestration concern that lives outside this package (see scripts/).
 """
 
+import logging
+
 import typer
 from sqlalchemy import create_engine
 
@@ -52,7 +54,20 @@ def main(
         help="Show the version and exit.",
     ),
 ) -> None:
-    """BDNS Sync command line interface."""
+    """BDNS Sync command line interface.
+
+    Configures logging here, not in `__main__.py`'s `if __name__ ==
+    "__main__":` guard. The installed `bdns-sync` console script
+    (`pyproject.toml`) imports and calls this Typer `app` directly, so that
+    guard never runs. Typer always runs this callback before any
+    subcommand regardless of entry point, so this is the one place
+    guaranteed to run every time.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
+    )
 
 
 TARGET_URL_OPTION = typer.Option(
@@ -100,7 +115,7 @@ def list_endpoints(
         "full", "--kind", help="one of: full, search, convocatorias"
     ),
 ) -> None:
-    """List known endpoint names, one per line -- for scripting (no hardcoded lists)."""
+    """List known endpoint names, one per line, for scripting (no hardcoded lists)."""
     if kind == "full":
         for name in FULL_SYNCERS:
             typer.echo(name)

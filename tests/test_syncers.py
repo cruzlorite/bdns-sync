@@ -40,15 +40,16 @@ class FakeConvocatoriasClient:
 
 def test_convocatorias_discover_then_detail_end_to_end():
     engine = create_engine("sqlite:///:memory:")
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     client = FakeConvocatoriasClient(
         search_results=[{"numeroConvocatoria": "A1"}, {"numeroConvocatoria": "A2"}],
         details_by_code={
-            "A1": {"codigoBDNS": "A1", "titulo": "one"},
-            "A2": {"codigoBDNS": "A2", "titulo": "two"},
+            "A1": {"codigoBDNS": "A1", "titulo": "one", "fechaRecepcion": yesterday},
+            "A2": {"codigoBDNS": "A2", "titulo": "two", "fechaRecepcion": yesterday},
         },
     )
     stats = sync_convocatorias(engine, client, "daily")
-    assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0}
+    assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0, "soft_deleted": 0, "skipped": 0}
     assert sorted(client.detail_calls) == ["A1", "A2"]
 
     yesterday = date.today() - timedelta(days=1)
@@ -61,26 +62,36 @@ def test_convocatorias_discover_then_detail_end_to_end():
 def test_convocatorias_one_detail_call_per_discovered_code_only():
     """N codes discovered -> exactly N detail calls, no per-record fan-out beyond that."""
     engine = create_engine("sqlite:///:memory:")
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     client = FakeConvocatoriasClient(
         search_results=[{"numeroConvocatoria": "A1"}],
-        details_by_code={"A1": {"codigoBDNS": "A1"}},
+        details_by_code={"A1": {"codigoBDNS": "A1", "fechaRecepcion": yesterday}},
     )
     sync_convocatorias(engine, client, "weekly")
     assert client.detail_calls == ["A1"]
 
 
-def test_convocatorias_does_not_close_out_codes_missing_from_window():
+def test_convocatorias_closes_out_a_code_missing_from_the_same_window():
+    """Window-scoped deletion: A2's own `fechaRecepcion` is inside daily's
+    range both times, so if it's genuinely missing from the second daily
+    run, that's a real deletion (see tests/test_timeline_convocatorias.py
+    for the aging-vs-deletion distinction this relies on).
+    """
     engine = create_engine("sqlite:///:memory:")
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     client = FakeConvocatoriasClient(
         search_results=[{"numeroConvocatoria": "A1"}, {"numeroConvocatoria": "A2"}],
-        details_by_code={"A1": {"codigoBDNS": "A1"}, "A2": {"codigoBDNS": "A2"}},
+        details_by_code={
+            "A1": {"codigoBDNS": "A1", "fechaRecepcion": yesterday},
+            "A2": {"codigoBDNS": "A2", "fechaRecepcion": yesterday},
+        },
     )
     sync_convocatorias(engine, client, "daily")
 
     client._search_results = [{"numeroConvocatoria": "A1"}]
     stats = sync_convocatorias(engine, client, "daily")
-    assert "closed" not in stats  # incremental apply never reports closes
-    assert len(current_rows(engine, "convocatorias")) == 2  # A2 untouched, not closed
+    assert stats["soft_deleted"] == 1
+    assert len(current_rows(engine, "convocatorias")) == 1  # A2 closed out
 
 
 # --- grandesbeneficiarios --------------------------------------------------

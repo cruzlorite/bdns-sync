@@ -6,7 +6,7 @@ day-by-day script covering insert / touch / rewrite / deletion / new-arrival.
 
 Deletion detection is the interesting case here: these are exactly the
 entities where a full-reconciliation pass sees the whole current state each
-run, so a row missing from the fetch means "withdrawn" -- unlike the
+run, so a row missing from the fetch means "withdrawn". That's unlike the
 incremental window entities in test_timeline_incremental_windows.py.
 """
 
@@ -76,20 +76,20 @@ def test_full_catalog_day_by_day_timeline(sync_fn, attr, table, key_fields, muta
     baseline = deepcopy(getattr(client, attr))
     assert len(baseline) >= 2, "fixture needs >=2 rows to exercise update and delete independently"
 
-    # Day 1: first run -- every fetched row is new
+    # Day 1: first run, every fetched row is new
     stats = sync_fn(engine, client)
     assert stats["fetched"] == len(baseline)
     assert stats["inserted"] == len(baseline)
     assert stats["updated"] == 0
-    assert stats["closed"] == 0
+    assert stats["soft_deleted"] == 0
     assert len(current_rows(engine, table)) == len(baseline)
 
-    # Day 2: identical re-fetch -- pure no-op, only `_synced_at` touched
+    # Day 2: identical re-fetch, a pure no-op that only touches `_synced_at`
     stats = sync_fn(engine, client)
-    assert stats == {"fetched": len(baseline), "inserted": 0, "updated": 0, "touched": len(baseline), "closed": 0}
+    assert stats == {"fetched": len(baseline), "inserted": 0, "updated": 0, "touched": len(baseline), "soft_deleted": 0}
 
-    # Day 3: upstream edits one field on one row -- SCD2 rewrite:
-    # old version closed out, new version becomes current
+    # Day 3: upstream edits one field on one row. SCD2 rewrite: the old
+    # version is closed out and the new version becomes current.
     getattr(client, attr)[0][mutate_field] = "__MUTATED__"
     stats = sync_fn(engine, client)
     assert stats["updated"] == 1
@@ -104,14 +104,14 @@ def test_full_catalog_day_by_day_timeline(sync_fn, attr, table, key_fields, muta
     new_version = next(r for r in current if r["_natural_key"] == mutated_key)
     assert new_version["payload"][mutate_field] == "__MUTATED__"
 
-    # Day 4: upstream withdraws the last row -- full reconciliation must
-    # detect it as a deletion (no incremental pass could see this)
+    # Day 4: upstream withdraws the last row. Full reconciliation must
+    # detect it as a deletion; no incremental pass could see this.
     getattr(client, attr).pop()
     stats = sync_fn(engine, client)
-    assert stats["closed"] == 1
+    assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, table)) == len(baseline) - 1
 
-    # Day 5: a brand-new row is registered -- plain insert
+    # Day 5: a brand-new row is registered, a plain insert
     new_row = fresh_copy_with_new_key(baseline[1], key_fields)
     getattr(client, attr).append(new_row)
     stats = sync_fn(engine, client)

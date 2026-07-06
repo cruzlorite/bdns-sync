@@ -70,6 +70,8 @@ Decenas de millones de filas -- traerlos enteros cada vez es inviable.
 
 La fecha de registro no cambia al editar un registro, así que reconsultar la misma ventana más tarde no encuentra altas nuevas, pero sí detecta ediciones por hash. Las correcciones se concentran cerca del registro y bajan con la antigüedad, de ahí la cascada: `daily` siempre corre, `weekly`/`monthly`/`annual` son verificaciones *extra* el mismo día, no sustituyen a la diaria.
 
+**Detección de bajas por ventana**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda` y `convocatorias` también detectan bajas reales, comparando, dentro de la misma ejecución, lo traído contra las filas de la tabla cuya propia fecha de registro (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, según la entidad) cae en ese mismo rango. No se compara contra la ejecución anterior, porque eso daría falsos positivos constantes: toda fila envejece fuera de una ventana móvil tarde o temprano, sin que eso signifique baja. `partidospoliticos_busqueda` queda fuera: confirmado en vivo que su payload no expone ningún campo de fecha de registro, pese a que el documento oficial afirma que "funciona igual, con los mismos filtros y resultados" que `concesiones_busqueda`. No es así. Es una limitación real y permanente, salvo que la API cambie.
+
 ## Buenas prácticas (oficiales)
 
 Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf):
@@ -78,12 +80,13 @@ Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosub
 - **Paginación al máximo** (10.000 registros/llamada).
 - **Cadencia diaria/semanal/mensual/anual por fecha de registro**: recomendación oficial, no diseño propio.
 - **`terceros` no se usa**: el propio documento lo señala como redundante.
-- **Reconciliación completa para detectar bajas**: las ayudas se retiran de la BDNS a los 4-5 años; los catálogos completos lo detectan, las pasadas incrementales no.
+- **Reconciliación completa para detectar bajas**: las ayudas se retiran de la BDNS a los 4 años naturales siguientes a la concesión; los catálogos completos lo detectan por comparación contra todo el estado actual. Para los grandes endpoints incrementales, donde reconciliar contra 20M+ filas cada vez es inviable, se usa en su lugar una comparación acotada a la fecha de registro propia de cada fila (ver más arriba).
 
 ## Limitaciones conocidas
 
 - `organos_codigo` / `organos_codigoadmin` sin implementar (grupo H).
-- Sin reconciliación periódica de bajas para los grandes endpoints de búsqueda.
+- `partidospoliticos_busqueda` sin detección de bajas: a diferencia de las otras 4 entidades incrementales, su payload no expone ningún campo de fecha de registro (confirmado en vivo con más de 70 filas reales, en dos rangos de fecha distintos).
+- Registros individuales malformados se descartan con log (nivel WARNING), se cuentan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto + contenido truncado a 200 caracteres, enlazado por `run_id`). Nunca se guardan en las tablas sincronizadas: no tienen clave natural real, así que no se pueden versionar como una fila normal.
 - Sin backfill histórico para `convocatorias` (cada registro es una llamada real).
 
 ## Desarrollo
@@ -99,6 +102,7 @@ make test
 Proyecto no oficial, sin afiliación con la Base de Datos Nacional de Subvenciones (BDNS) ni con el Ministerio de Hacienda. Se distribuye bajo licencia GPL v3, que excluye expresamente cualquier garantía: se usa bajo tu propia responsabilidad, sin garantía de ningún tipo y sin que el autor asuma responsabilidad alguna por daños, pérdidas de datos o usos indebidos.
 
 Los datos sincronizados proceden del [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) y están sujetos a su propio [aviso legal](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) y a las [buenas prácticas de la API](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf).
+
 ## Licencia y enlaces
 
 - [GNU GPL v3.0](./LICENSE)

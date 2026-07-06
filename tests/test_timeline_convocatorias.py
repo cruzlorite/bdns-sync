@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 
 from bdns.sync.syncers import sync_convocatorias
 from tests.fake_client import FakeBDNSClient
-from tests.timeline_helpers import current_rows
+from tests.timeline_helpers import current_rows, last_sync_run, sync_errors_for
 
 
 def test_convocatorias_cascade_progressively_reveals_older_registrations():
@@ -71,18 +71,47 @@ def test_convocatorias_malformed_detail_is_skipped_not_crashed():
     assert stats["inserted"] == 0
     assert len(current_rows(engine, "convocatorias")) == 0
 
+    # the skip is durable, not just a transient log line
+    assert last_sync_run(engine, "convocatorias")["rows_skipped"] == 1
+    [error] = sync_errors_for(engine, "convocatorias")
+    assert error["context"] == "convocatorias numConv=927266"
+    assert error["content"] == "<html>not json</html>"
 
-def test_convocatorias_never_closes_out_codes_missing_from_window():
+
+def test_convocatorias_detects_a_real_deletion_within_the_current_window():
+    """`fechaRecepcion` (the detail record's own registration date, confirmed
+    live) is inside daily's [yesterday, yesterday] range for the
+    reg_days_ago=0 code. So if it's genuinely missing from today's
+    discovery, that's a real deletion and must be closed.
+    """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "monthly")
+    sync_convocatorias(engine, client, "daily")
     before = len(current_rows(engine, "convocatorias"))
 
     client.convocatorias_busqueda = [
         rec for rec in client.convocatorias_busqueda if rec["reg_days_ago"] != 0
     ]
     stats = sync_convocatorias(engine, client, "daily")
-    assert "closed" not in stats
+    assert stats["soft_deleted"] == 1
+    assert len(current_rows(engine, "convocatorias")) == before - 1
+
+
+def test_convocatorias_ignores_codes_outside_the_current_window():
+    """The reg_days_ago=20 code's own fechaRecepcion isn't inside daily's
+    range, so missing from today's daily discovery says nothing about it.
+    It must not be closed; this is the aging-vs-deletion distinction.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    client = FakeBDNSClient()
+    sync_convocatorias(engine, client, "monthly")  # seeds reg_days_ago 0, 5, 20
+    before = len(current_rows(engine, "convocatorias"))
+
+    client.convocatorias_busqueda = [
+        rec for rec in client.convocatorias_busqueda if rec["reg_days_ago"] != 20
+    ]
+    stats = sync_convocatorias(engine, client, "daily")  # only covers reg_days_ago=0
+    assert stats.get("soft_deleted", 0) == 0
     assert len(current_rows(engine, "convocatorias")) == before
 
 

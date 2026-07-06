@@ -12,15 +12,16 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """One named `sync_*` function per synced entity (per docs/sync-strategy.md).
-Most are a one-liner delegating to the shared runners in `bdns.sync.generic`;
-convocatorias/grandesbeneficiarios/planesestrategicos have real multi-step
-logic (discovery + per-code detail calls) so they're longer, but still just
-functions in this same file -- nothing here needs its own module.
+Most are a one-liner delegating to the shared runners in `bdns.sync.generic`.
+convocatorias, grandesbeneficiarios, and planesestrategicos have real
+multi-step logic (discovery plus per-code detail calls), so they're longer,
+but they're still just functions in this same file. None of them needs its
+own module.
 """
 
 import logging
 from datetime import date, timedelta
-from typing import Any, Dict, Iterator, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
@@ -34,17 +35,27 @@ ADMIN_TYPES: Tuple[str, ...] = ("C", "A", "L", "O")
 REGLAMENTOS_AMBITOS: Tuple[str, ...] = ("C", "A", "M", "S", "P", "G")
 
 
-def _skip_malformed(items: Iterator[Any], context: str) -> Iterator[dict]:
-    """Individual records can come back malformed -- confirmed live: BDNS's
-    backend rejects a specific record with an HTML error page instead of
-    JSON, for reasons outside our control (not a rate limit, not a params
-    issue -- other calls immediately before/after the same record succeed
-    fine). Skip and log rather than crashing the whole batch over one
-    bad record.
+def _skip_malformed(
+    items: Iterator[Any], context: str, errors: Optional[List[Dict[str, str]]] = None
+) -> Iterator[dict]:
+    """Individual records can come back malformed. Confirmed live: BDNS's
+    backend sometimes rejects a specific record with an HTML error page
+    instead of JSON, for reasons outside our control (not a rate limit, not
+    a params issue, since other calls immediately before or after the same
+    record succeed fine). Skip and log rather than crashing the whole batch
+    over one bad record.
+
+    When `errors` is given, each skip appends a `{"context", "content"}`
+    dict to it. The caller threads that list back through `stats` so
+    `run_with_bookkeeping` can persist it to `_sync_errors`, a durable
+    record that survives after the log scrolls away.
     """
     for item in items:
         if not isinstance(item, dict):
-            logger.warning("skipping malformed record (%s): %r", context, str(item)[:200])
+            content = str(item)[:200]
+            logger.warning("skipping malformed record (%s): %r", context, content)
+            if errors is not None:
+                errors.append({"context": context, "content": content})
             continue
         yield item
 
@@ -83,12 +94,12 @@ def sync_convocatorias_ultimas(engine, client: BDNSClient) -> Dict[str, int]:
 
 
 def sync_regiones(engine, client: BDNSClient) -> Dict[str, int]:
-    # tree-shaped, but a single call -- no idAdmon sweep, unlike organos*
+    # Tree-shaped, but still a single call. Unlike organos*, there's no idAdmon sweep here.
     return sync_full_catalog(engine, client, "regiones", "fetch_regiones", ("id",))
 
 
 def sync_sanciones_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
-    # no real id field in the source -- best-effort composite of 3 fields
+    # There's no real id field in the source, so this is a best-effort composite of 3 fields.
     return sync_full_catalog(
         engine,
         client,
@@ -135,8 +146,18 @@ def sync_reglamentos(engine, client: BDNSClient) -> Dict[str, int]:
 
 
 def sync_concesiones_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
+    # `fechaAlta` is the payload's own registration date, confirmed live
+    # against 500+ rows across two date ranges. Passing it here lets this
+    # window detect real deletions, not just inserts and edits. See
+    # scd2.apply_incremental for how that comparison works.
     return sync_search_window(
-        engine, client, "concesiones_busqueda", "fetch_concesiones_busqueda", ("id",), window
+        engine,
+        client,
+        "concesiones_busqueda",
+        "fetch_concesiones_busqueda",
+        ("id",),
+        window,
+        reg_date_field="fechaAlta",
     )
 
 
@@ -148,16 +169,30 @@ def sync_ayudasestado_busqueda(engine, client: BDNSClient, window: str) -> Dict[
         "fetch_ayudasestado_busqueda",
         ("idConcesion",),
         window,
+        reg_date_field="fechaAlta",
     )
 
 
 def sync_minimis_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
     return sync_search_window(
-        engine, client, "minimis_busqueda", "fetch_minimis_busqueda", ("idConcesion",), window
+        engine,
+        client,
+        "minimis_busqueda",
+        "fetch_minimis_busqueda",
+        ("idConcesion",),
+        window,
+        reg_date_field="fechaRegistro",
     )
 
 
 def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window: str) -> Dict[str, int]:
+    # No `reg_date_field` here. Confirmed live, using 71 rows across two
+    # date ranges six months apart, that this payload never carries a
+    # registration-date field. The official doc claims this endpoint
+    # "works the same, same filters and results" as concesiones_busqueda,
+    # but that claim doesn't hold for this field. Window-scoped deletion
+    # detection isn't possible here; this is a real, permanent limitation,
+    # documented in the README.
     return sync_search_window(
         engine,
         client,
@@ -170,15 +205,17 @@ def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window: str) -> 
 
 # --- convocatorias: two-step discover-then-detail -------------------------
 #
-# `convocatorias_busqueda` is discovery only (not stored as its own table) --
-# it just yields `numeroConvocatoria` codes for a window. Each code then
-# costs one real detail call (`fetch_convocatorias(numConv=X)`, official doc:
-# "aqui cada Convocatoria te costara una llamada") -- that detail record is
-# what actually gets versioned into the `convocatorias` table.
+# `convocatorias_busqueda` is discovery only, not stored as its own table.
+# It just yields `numeroConvocatoria` codes for a window. Each code then
+# costs one real detail call (`fetch_convocatorias(numConv=X)`, per the
+# official doc: "aqui cada Convocatoria te costara una llamada"). That
+# detail record is what actually gets versioned into the `convocatorias`
+# table.
 #
-# Note: the search result's identifier field is `numeroConvocatoria`, but the
-# *detail* record (what actually gets stored) carries the same value under a
-# different key, `codigoBDNS` -- confirmed live, not documented anywhere.
+# Note: the search result's identifier field is `numeroConvocatoria`, but
+# the detail record (what actually gets stored) carries the same value
+# under a different key, `codigoBDNS`. Confirmed live; not documented
+# anywhere.
 
 CONVOCATORIAS_ENDPOINT = "convocatorias"
 CONVOCATORIAS_KEY_FIELDS = ("codigoBDNS",)
@@ -192,10 +229,16 @@ def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> S
     return codes
 
 
-def fetch_convocatoria_details(client: BDNSClient, codes: Set[str]) -> Iterator[dict]:
-    """One real API call per code -- this is the expensive part."""
+def fetch_convocatoria_details(
+    client: BDNSClient, codes: Set[str], errors: Optional[List[Dict[str, str]]] = None
+) -> Iterator[dict]:
+    """One real API call per code. This is the costly step in the two-step
+    discover-then-detail flow.
+    """
     for code in codes:
-        yield from _skip_malformed(client.fetch_convocatorias(numConv=code), f"convocatorias numConv={code}")
+        yield from _skip_malformed(
+            client.fetch_convocatorias(numConv=code), f"convocatorias numConv={code}", errors
+        )
 
 
 def sync_convocatorias(engine, client: BDNSClient, window: str) -> Dict[str, int]:
@@ -207,22 +250,36 @@ def sync_convocatorias(engine, client: BDNSClient, window: str) -> Dict[str, int
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=days - 1)
     codes = discover_convocatoria_codes(client, start, end)
-    return run_with_bookkeeping(
-        engine,
-        CONVOCATORIAS_ENDPOINT,
-        run_type=window,
-        apply_fn=lambda conn, table, staging: apply_incremental(
-            conn, table, staging, fetch_convocatoria_details(client, codes), CONVOCATORIAS_KEY_FIELDS
-        ),
-    )
+    errors: List[Dict[str, str]] = []
+
+    def apply_fn(conn, table, staging):
+        stats = apply_incremental(
+            conn,
+            table,
+            staging,
+            fetch_convocatoria_details(client, codes, errors),
+            CONVOCATORIAS_KEY_FIELDS,
+            # `fechaRecepcion` is the detail record's own registration date,
+            # confirmed live against 1000 rows across two date ranges. This
+            # enables window-scoped deletion detection, the same way as
+            # concesiones_busqueda.
+            reg_date_field="fechaRecepcion",
+            window_start=start,
+            window_end=end,
+        )
+        stats["skipped"] = len(errors)
+        stats["_skip_details"] = errors
+        return stats
+
+    return run_with_bookkeeping(engine, CONVOCATORIAS_ENDPOINT, run_type=window, apply_fn=apply_fn)
 
 
 # --- grandesbeneficiarios: two tables for one entity ----------------------
 #
 # `_anios` is a trivial flat catalog (the valid years to query). `_busqueda`
-# is the actual data, but needs `anios` swept dynamically from `_anios`
-# first rather than a hardcoded year list, per the doc -- that's why this
-# doesn't reduce to a plain sync_full_catalog call.
+# is the actual data, but it needs `anios` swept dynamically from `_anios`
+# first, rather than from a hardcoded year list, per the doc. That's why
+# this doesn't reduce to a plain sync_full_catalog call.
 
 GRANDESBENEFICIARIOS_ANIOS_ENDPOINT = "grandesbeneficiarios_anios"
 GRANDESBENEFICIARIOS_BUSQUEDA_ENDPOINT = "grandesbeneficiarios_busqueda"
@@ -259,11 +316,11 @@ def sync_grandesbeneficiarios_busqueda(engine, client: BDNSClient) -> Dict[str, 
 #
 # `_busqueda` is a trivial full-crawl catalog (~2,000 rows) that doubles as
 # the discovery step for the other two: detail and validity, each looked up
-# by idPES and looped over the full discovered set every run -- no cascading
-# windows needed, cheap at this volume (same reasoning as convocatorias, just
-# smaller). Neither the detail nor the vigencia response echoes back idPES
-# (confirmed live) -- it's tagged onto payload explicitly, same pattern as
-# organos' idAdmon tag.
+# by idPES and looped over the full discovered set every run. No cascading
+# windows are needed; this volume is cheap enough (same reasoning as
+# convocatorias, just smaller). Neither the detail nor the vigencia response
+# echoes back idPES, confirmed live, so it's tagged onto the payload
+# explicitly, the same pattern used for organos' idAdmon tag.
 
 PLANESESTRATEGICOS_BUSQUEDA_ENDPOINT = "planesestrategicos_busqueda"
 PLANESESTRATEGICOS_ENDPOINT = "planesestrategicos"
@@ -285,19 +342,23 @@ def discover_pes_ids(client: BDNSClient) -> Set[int]:
     return {item["id"] for item in client.fetch_planesestrategicos_busqueda()}
 
 
-def fetch_pes_details(client: BDNSClient, ids: Set[int]) -> Iterator[dict]:
+def fetch_pes_details(
+    client: BDNSClient, ids: Set[int], errors: Optional[List[Dict[str, str]]] = None
+) -> Iterator[dict]:
     for id_pes in ids:
         items = client.fetch_planesestrategicos(idPES=id_pes)
-        for item in _skip_malformed(items, f"planesestrategicos idPES={id_pes}"):
+        for item in _skip_malformed(items, f"planesestrategicos idPES={id_pes}", errors):
             item = dict(item)
             item["idPES"] = id_pes
             yield item
 
 
-def fetch_pes_vigencias(client: BDNSClient, ids: Set[int]) -> Iterator[dict]:
+def fetch_pes_vigencias(
+    client: BDNSClient, ids: Set[int], errors: Optional[List[Dict[str, str]]] = None
+) -> Iterator[dict]:
     for id_pes in ids:
         items = client.fetch_planesestrategicos_vigencia(idPES=id_pes)
-        for item in _skip_malformed(items, f"planesestrategicos_vigencia idPES={id_pes}"):
+        for item in _skip_malformed(items, f"planesestrategicos_vigencia idPES={id_pes}", errors):
             item = dict(item)
             item["idPES"] = id_pes
             yield item
@@ -305,25 +366,33 @@ def fetch_pes_vigencias(client: BDNSClient, ids: Set[int]) -> Iterator[dict]:
 
 def sync_planesestrategicos(engine, client: BDNSClient) -> Dict[str, int]:
     ids = discover_pes_ids(client)
-    return run_with_bookkeeping(
-        engine,
-        PLANESESTRATEGICOS_ENDPOINT,
-        run_type="full",
-        apply_fn=lambda conn, table, staging: apply_full_reconciliation(
-            conn, table, staging, fetch_pes_details(client, ids), PLANESESTRATEGICOS_KEY_FIELDS
-        ),
-    )
+    errors: List[Dict[str, str]] = []
+
+    def apply_fn(conn, table, staging):
+        stats = apply_full_reconciliation(
+            conn, table, staging, fetch_pes_details(client, ids, errors), PLANESESTRATEGICOS_KEY_FIELDS
+        )
+        stats["skipped"] = len(errors)
+        stats["_skip_details"] = errors
+        return stats
+
+    return run_with_bookkeeping(engine, PLANESESTRATEGICOS_ENDPOINT, run_type="full", apply_fn=apply_fn)
 
 
 def sync_planesestrategicos_vigencia(engine, client: BDNSClient) -> Dict[str, int]:
     ids = discover_pes_ids(client)
+    errors: List[Dict[str, str]] = []
+
+    def apply_fn(conn, table, staging):
+        stats = apply_full_reconciliation(
+            conn, table, staging, fetch_pes_vigencias(client, ids, errors), PLANESESTRATEGICOS_KEY_FIELDS
+        )
+        stats["skipped"] = len(errors)
+        stats["_skip_details"] = errors
+        return stats
+
     return run_with_bookkeeping(
-        engine,
-        PLANESESTRATEGICOS_VIGENCIA_ENDPOINT,
-        run_type="full",
-        apply_fn=lambda conn, table, staging: apply_full_reconciliation(
-            conn, table, staging, fetch_pes_vigencias(client, ids), PLANESESTRATEGICOS_KEY_FIELDS
-        ),
+        engine, PLANESESTRATEGICOS_VIGENCIA_ENDPOINT, run_type="full", apply_fn=apply_fn
     )
 
 

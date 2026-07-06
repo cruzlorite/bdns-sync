@@ -12,7 +12,7 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """Shared sync shapes reused by several entity modules. Each entity module
-still owns its own name, key fields, and any real one-off logic -- only the
+still owns its own name, key fields, and any real one-off logic. Only the
 mechanical "fetch, then apply" plumbing lives here.
 """
 
@@ -58,9 +58,9 @@ def sync_swept_catalog(
     sweep_values: Sequence[str],
     key_fields: Sequence[str],
 ) -> Dict[str, int]:
-    """Sweep `sweep_param` across `sweep_values`, merge into one table before
-    reconciling -- reconciling per-sweep-value would wrongly close out the
-    other values' rows as "missing". The sweep value is tagged onto the
+    """Sweep `sweep_param` across `sweep_values`, merging into one table
+    before reconciling. Reconciling per sweep value would wrongly close out
+    the other values' rows as "missing". The sweep value is tagged onto the
     payload under `sweep_param` since the API doesn't echo it back.
     """
     fetch = getattr(client, fetch_method_name)
@@ -89,10 +89,16 @@ def sync_search_window(
     fetch_method_name: str,
     key_fields: Sequence[str],
     window: str,
+    reg_date_field: str = None,
 ) -> Dict[str, int]:
     """Run one cascading re-verification window: fetch the reg-date window,
-    apply incrementally (never closes out keys -- a window is a subset of
-    the table, not the full current state).
+    then apply incrementally. By default this never closes out keys, since
+    a window is a subset of the table, not the full current state.
+
+    `reg_date_field` opts into window-scoped deletion detection (see
+    `scd2.apply_incremental`). Only entities that actually expose their own
+    registration date in the payload can use this; that was confirmed live
+    per entity, not assumed.
     """
     fetch = getattr(client, fetch_method_name)
     days = WINDOWS[window]
@@ -103,6 +109,13 @@ def sync_search_window(
         endpoint_name,
         run_type=window,
         apply_fn=lambda conn, table, staging: apply_incremental(
-            conn, table, staging, fetch(fechaRegInicio=start, fechaRegFin=end), key_fields
+            conn,
+            table,
+            staging,
+            fetch(fechaRegInicio=start, fechaRegFin=end),
+            key_fields,
+            reg_date_field=reg_date_field,
+            window_start=start,
+            window_end=end,
         ),
     )
