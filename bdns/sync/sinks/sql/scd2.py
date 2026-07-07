@@ -160,6 +160,11 @@ def _load_staging(
             adapter.insert_rows(conn, staging, chunk)
             fetched += len(chunk)
             chunk = []
+            # every ~50k rows: staging a multi-million-row backfill takes
+            # hours, so it can't be a silent gap between the per-chunk fetch
+            # logs and the final "fetch done" line.
+            if fetched % (chunk_size * 10) == 0:
+                logger.info("%s: %d rows staged so far", staging.name, fetched)
     if chunk:
         adapter.insert_rows(conn, staging, chunk)
         fetched += len(chunk)

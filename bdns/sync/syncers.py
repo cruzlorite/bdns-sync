@@ -347,58 +347,88 @@ DETAIL_WORKERS = 8
 DETAIL_SPACING_SECONDS = 0.105
 
 
-def fetch_convocatoria_details(
-    client: BDNSClient,
-    codes: Set[str],
-    errors: Optional[List[Dict[str, str]]] = None,
+def _paced_details(
+    keys,
+    fetch_single,
+    context_for,
+    errors: Optional[List[Dict[str, str]]],
+    label: str,
+    transform=None,
     max_workers: int = DETAIL_WORKERS,
 ) -> Iterator[dict]:
-    """One real API call per code. This is the costly step in the two-step
-    discover-then-detail flow.
+    """Shared engine for every discover-then-detail step: one real API call
+    per discovered key, run through a paced thread pool.
 
-    Calls run through a thread pool: each `numConv` response is a single
-    record, so the client's page-level parallelism never engages, and a
-    sequential loop is latency-bound far below the 10 req/s budget
-    (measured live: 0.2-1.9 s/call depending on server load, i.e. 0.5-4.5
-    req/s). Request starts are paced `DETAIL_SPACING_SECONDS` apart, which
-    is what the server actually enforces (see comment above); with paced
-    starts the worker count only needs to cover latency (8 workers covers
-    ~0.8s of latency at full rate). Submission is windowed (2x workers) so
-    a backfill of tens of thousands of codes never buffers more than a
-    handful of fetched records ahead of the consumer.
+    Each detail response is a single record, so the client's page-level
+    parallelism never engages, and a sequential loop is latency-bound far
+    below the 10 req/s budget (measured live on convocatorias: 0.2-1.9
+    s/call depending on server load, i.e. 0.5-4.5 req/s). Request starts
+    are paced `DETAIL_SPACING_SECONDS` apart, which is what the server
+    actually enforces (see comment above); with paced starts the worker
+    count only needs to cover latency (8 workers covers ~0.8s of latency
+    at full rate). Submission is windowed (2x workers) so a backfill of
+    tens of thousands of keys never buffers more than a handful of fetched
+    records ahead of the consumer.
 
     `_skip_malformed` runs in the consumer thread, keeping `errors`
     single-threaded. A hard fetch failure (after the client's own retries)
-    surfaces on `.result()` and fails the run, same as the sequential loop
-    did.
+    surfaces on `.result()` and fails the run, same as a sequential loop
+    would. `transform(key, item)`, when given, tags each surviving item
+    (e.g. endpoints that don't echo their own key back). Progress is
+    logged every 500 keys.
     """
     pace_lock = threading.Lock()
     next_start = [0.0]
 
-    def fetch_one(code):
+    def fetch_one(key):
         with pace_lock:
             now = time.monotonic()
             wait = max(0.0, next_start[0] - now)
             next_start[0] = now + wait + DETAIL_SPACING_SECONDS
         if wait:
             time.sleep(wait)
-        return code, list(client.fetch_convocatorias(numConv=code))
+        return key, list(fetch_single(key))
 
-    codes_iter = iter(codes)
+    total = len(keys)
+    completed = 0
+    keys_iter = iter(keys)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         pending = {
-            executor.submit(fetch_one, code)
-            for code in itertools.islice(codes_iter, max_workers * 2)
+            executor.submit(fetch_one, key)
+            for key in itertools.islice(keys_iter, max_workers * 2)
         }
         while pending:
             done, pending = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED
             )
-            for code in itertools.islice(codes_iter, len(done)):
-                pending.add(executor.submit(fetch_one, code))
+            for key in itertools.islice(keys_iter, len(done)):
+                pending.add(executor.submit(fetch_one, key))
             for future in done:
-                code, items = future.result()
-                yield from _skip_malformed(items, f"convocatorias numConv={code}", errors)
+                key, items = future.result()
+                completed += 1
+                if completed % 500 == 0 or completed == total:
+                    logger.info("%s: detail %d/%d keys", label, completed, total)
+                for item in _skip_malformed(items, context_for(key), errors):
+                    yield transform(key, item) if transform else item
+
+
+def fetch_convocatoria_details(
+    client: BDNSClient,
+    codes: Set[str],
+    errors: Optional[List[Dict[str, str]]] = None,
+    max_workers: int = DETAIL_WORKERS,
+) -> Iterator[dict]:
+    """One real API call per code, paced and parallel (see `_paced_details`).
+    This is the costly step in the two-step discover-then-detail flow.
+    """
+    return _paced_details(
+        codes,
+        lambda code: client.fetch_convocatorias(numConv=code),
+        lambda code: f"convocatorias numConv={code}",
+        errors,
+        "convocatorias",
+        max_workers=max_workers,
+    )
 
 
 def sync_convocatorias(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
@@ -489,26 +519,35 @@ def discover_pes_ids(client: BDNSClient) -> Set[int]:
     return {item["id"] for item in all_pages(client.fetch_planesestrategicos_busqueda)()}
 
 
+def _tag_id_pes(id_pes, item):
+    # Neither detail nor vigencia echoes idPES back, confirmed live.
+    return {**item, "idPES": id_pes}
+
+
 def fetch_pes_details(
     client: BDNSClient, ids: Set[int], errors: Optional[List[Dict[str, str]]] = None
 ) -> Iterator[dict]:
-    for id_pes in ids:
-        items = client.fetch_planesestrategicos(idPES=id_pes)
-        for item in _skip_malformed(items, f"planesestrategicos idPES={id_pes}", errors):
-            item = dict(item)
-            item["idPES"] = id_pes
-            yield item
+    return _paced_details(
+        ids,
+        lambda id_pes: client.fetch_planesestrategicos(idPES=id_pes),
+        lambda id_pes: f"planesestrategicos idPES={id_pes}",
+        errors,
+        "planesestrategicos",
+        transform=_tag_id_pes,
+    )
 
 
 def fetch_pes_vigencias(
     client: BDNSClient, ids: Set[int], errors: Optional[List[Dict[str, str]]] = None
 ) -> Iterator[dict]:
-    for id_pes in ids:
-        items = client.fetch_planesestrategicos_vigencia(idPES=id_pes)
-        for item in _skip_malformed(items, f"planesestrategicos_vigencia idPES={id_pes}", errors):
-            item = dict(item)
-            item["idPES"] = id_pes
-            yield item
+    return _paced_details(
+        ids,
+        lambda id_pes: client.fetch_planesestrategicos_vigencia(idPES=id_pes),
+        lambda id_pes: f"planesestrategicos_vigencia idPES={id_pes}",
+        errors,
+        "planesestrategicos_vigencia",
+        transform=_tag_id_pes,
+    )
 
 
 def sync_planesestrategicos(sink, client: BDNSClient) -> Dict[str, int]:
