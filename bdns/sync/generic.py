@@ -16,6 +16,7 @@ still owns its own name, key fields, and any real one-off logic. Only the
 mechanical "fetch, then apply" plumbing lives here.
 """
 
+import inspect
 import logging
 from datetime import date, timedelta
 from typing import Dict, Iterator, Optional, Sequence, Tuple
@@ -25,6 +26,27 @@ from bdns.sync.sinks import Sink
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+
+def all_pages(fetch):
+    """Wrap a client fetch method so paginated endpoints return EVERY page.
+
+    bdns-fetch's `num_pages` option defaults to 1, which silently truncates
+    any response bigger than one page (pageSize max 10,000) -- caught live:
+    grandesbeneficiarios_busqueda returned 10,000 of 142,260 rows. Passing
+    `num_pages=0` ("all pages") on every call is the fix, but only the
+    paginated methods accept the parameter, so it's added by signature
+    inspection instead of blindly.
+    """
+    params = inspect.signature(fetch).parameters
+    if "num_pages" not in params:
+        return fetch
+
+    def fetch_all(*args, **kwargs):
+        kwargs.setdefault("num_pages", 0)
+        return fetch(*args, **kwargs)
+
+    return fetch_all
 
 # window name -> reg-date window size in days. Shared by every entity that
 # does cascading re-verification (concesiones, ayudasestado, minimis,
@@ -88,7 +110,7 @@ def sync_full_catalog(
     sink: Sink, client: BDNSClient, endpoint_name: str, fetch_method_name: str, key_fields: Sequence[str]
 ) -> Dict[str, int]:
     """Fetch everything with one no-arg call, full-reconcile every run."""
-    fetch = getattr(client, fetch_method_name)
+    fetch = all_pages(getattr(client, fetch_method_name))
     return sink.sync_full(endpoint_name, fetch(), key_fields)
 
 
@@ -106,7 +128,7 @@ def sync_swept_catalog(
     the other values' rows as "missing". The sweep value is tagged onto the
     payload under `sweep_param` since the API doesn't echo it back.
     """
-    fetch = getattr(client, fetch_method_name)
+    fetch = all_pages(getattr(client, fetch_method_name))
 
     def rows():
         for value in sweep_values:
@@ -174,7 +196,7 @@ def sync_search_range(
     `apply_incremental` still span the whole `[start, end]`, since deletion
     scoping cares about the full range, not how it was split to fetch it.
     """
-    fetch = getattr(client, fetch_method_name)
+    fetch = all_pages(getattr(client, fetch_method_name))
 
     def rows():
         for chunk_start, chunk_end in iter_date_chunks(start, end):
@@ -207,7 +229,7 @@ def sync_search_range_inclusive(
     `chunk_end` is passed as-is, with NO `to_api_upper_bound` bridge. Calling
     that bridge here would over-fetch one extra day past the window.
     """
-    fetch = getattr(client, fetch_method_name)
+    fetch = all_pages(getattr(client, fetch_method_name))
 
     def rows():
         for chunk_start, chunk_end in iter_date_chunks(start, end):

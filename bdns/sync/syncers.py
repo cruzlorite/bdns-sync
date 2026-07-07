@@ -30,6 +30,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from bdns.fetch import BDNSClient, TipoAdministracion
 from bdns.fetch.types import Ambito
 from bdns.sync.generic import (
+    all_pages,
     iter_date_chunks,
     resolve_when,
     sync_full_catalog,
@@ -326,7 +327,7 @@ def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> S
     """
     codes: Set[str] = set()
     for chunk_start, chunk_end in iter_date_chunks(start, end):
-        for item in client.fetch_convocatorias_busqueda(
+        for item in all_pages(client.fetch_convocatorias_busqueda)(
             fechaDesde=chunk_start, fechaHasta=chunk_end
         ):
             codes.add(item["numeroConvocatoria"])
@@ -453,7 +454,7 @@ def sync_grandesbeneficiarios_busqueda(sink, client: BDNSClient) -> Dict[str, in
     anios = [item["id"] for item in client.fetch_grandesbeneficiarios_anios()]
     return sink.sync_full(
         GRANDESBENEFICIARIOS_BUSQUEDA_ENDPOINT,
-        client.fetch_grandesbeneficiarios_busqueda(anios=anios),
+        all_pages(client.fetch_grandesbeneficiarios_busqueda)(anios=anios),
         GRANDESBENEFICIARIOS_KEY_FIELDS,
     )
 
@@ -485,7 +486,7 @@ def sync_planesestrategicos_busqueda(sink, client: BDNSClient) -> Dict[str, int]
 
 
 def discover_pes_ids(client: BDNSClient) -> Set[int]:
-    return {item["id"] for item in client.fetch_planesestrategicos_busqueda()}
+    return {item["id"] for item in all_pages(client.fetch_planesestrategicos_busqueda)()}
 
 
 def fetch_pes_details(
