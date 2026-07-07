@@ -21,11 +21,11 @@ from datetime import date
 from typing import Optional
 
 import typer
-from sqlalchemy import create_engine
 
 from bdns.fetch import BDNSClient
 from bdns.sync import __version__
 from bdns.sync.generic import WINDOWS
+from bdns.sync.sinks import get_sink
 from bdns.sync.syncers import (
     CONVOCATORIAS_ENDPOINT,
     FULL_SYNCERS,
@@ -117,7 +117,7 @@ def sync(
     or an explicit `--since [--until]` backfill range. Full-replace endpoints
     ignore all of these.
     """
-    engine = create_engine(target_url)
+    sink = get_sink(target_url)
     client = BDNSClient()
 
     since_date = _parse_iso_date(since, "--since")
@@ -130,15 +130,15 @@ def sync(
                 raise typer.BadParameter("use either --window or --since, not both")
             if until_date is not None and until_date < since_date:
                 raise typer.BadParameter("--until must not be before --since")
-            stats = sync_fn(engine, client, since=since_date, until=until_date)
+            stats = sync_fn(sink, client, since=since_date, until=until_date)
         elif window is not None:
             if window not in WINDOWS:
                 raise typer.BadParameter(f"window must be one of {', '.join(WINDOWS)}")
-            stats = sync_fn(engine, client, window)
+            stats = sync_fn(sink, client, window)
         else:
             raise typer.BadParameter(f"{endpoint} requires --window or --since")
     elif endpoint in FULL_SYNCERS:
-        stats = FULL_SYNCERS[endpoint](engine, client)
+        stats = FULL_SYNCERS[endpoint](sink, client)
     else:
         raise typer.BadParameter(f"unknown endpoint: {endpoint}")
 

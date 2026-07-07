@@ -36,6 +36,7 @@ from sqlalchemy import and_, delete, exists, func, insert, literal, or_, select,
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.schema import Table
 
+from bdns.sync.sinks.sql.dialects import get_adapter
 from bdns.sync.hashing import natural_key, row_hash
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,7 @@ def _load_staging(
     chunk_size: int,
     reg_date_field: Optional[str] = None,
 ) -> int:
+    adapter = get_adapter(conn.engine)
     fetched = 0
     chunk = []
     for payload in rows:
@@ -155,11 +157,11 @@ def _load_staging(
             staged["_reg_date"] = datetime.strptime(payload[reg_date_field], "%Y-%m-%d").date()
         chunk.append(staged)
         if len(chunk) >= chunk_size:
-            conn.execute(insert(staging), chunk)
+            adapter.insert_rows(conn, staging, chunk)
             fetched += len(chunk)
             chunk = []
     if chunk:
-        conn.execute(insert(staging), chunk)
+        adapter.insert_rows(conn, staging, chunk)
         fetched += len(chunk)
     return fetched
 

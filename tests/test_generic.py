@@ -12,7 +12,8 @@ from bdns.sync.generic import (
     to_api_upper_bound,
     window_bounds,
 )
-from bdns.sync.schema import build_control_tables, build_sync_table
+from bdns.sync.sinks.sql.schema import build_control_tables, build_sync_table
+from bdns.sync.sinks.sql import SQLSink
 from tests.fake_client import FakeBDNSClient, reg_date
 
 
@@ -185,7 +186,7 @@ def test_full_catalog_writes_rows_and_run_log():
     engine = create_engine("sqlite:///:memory:")
     client = FakeFullClient([{"id": 1, "v": "a"}, {"id": 2, "v": "b"}])
 
-    stats = sync_full_catalog(engine, client, "widgets", "fetch_widgets", ("id",))
+    stats = sync_full_catalog(SQLSink(engine), client, "widgets", "fetch_widgets", ("id",))
     assert stats == {"fetched": 2, "inserted": 2, "updated": 0, "touched": 0, "soft_deleted": 0}
 
     metadata = MetaData()
@@ -205,10 +206,10 @@ def test_full_catalog_writes_rows_and_run_log():
 def test_full_catalog_second_run_detects_deletion():
     engine = create_engine("sqlite:///:memory:")
     client = FakeFullClient([{"id": 1}, {"id": 2}])
-    sync_full_catalog(engine, client, "widgets", "fetch_widgets", ("id",))
+    sync_full_catalog(SQLSink(engine), client, "widgets", "fetch_widgets", ("id",))
 
     client._rows = [{"id": 1}]
-    stats = sync_full_catalog(engine, client, "widgets", "fetch_widgets", ("id",))
+    stats = sync_full_catalog(SQLSink(engine), client, "widgets", "fetch_widgets", ("id",))
     assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, "widgets")) == 1
 
@@ -229,7 +230,7 @@ def test_swept_catalog_merges_sweep_values_and_tags_payload():
     client = FakeSweptClient(by_value={"X": [{"id": 1}], "Y": [{"id": 1}], "Z": []})
 
     stats = sync_swept_catalog(
-        engine, client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
+        SQLSink(engine), client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
     )
     assert stats["inserted"] == 2  # (X,1) and (Y,1) are distinct entities
 
@@ -243,12 +244,12 @@ def test_swept_catalog_does_not_close_other_sweep_values_as_missing():
     engine = create_engine("sqlite:///:memory:")
     client = FakeSweptClient(by_value={"X": [{"id": 1}], "Y": [{"id": 2}], "Z": []})
     sync_swept_catalog(
-        engine, client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
+        SQLSink(engine), client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
     )
 
     client._by_value["X"] = [{"id": 1, "v": "changed"}]
     stats = sync_swept_catalog(
-        engine, client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
+        SQLSink(engine), client, "widgets", "fetch_widgets", "region", ("X", "Y", "Z"), ("region", "id")
     )
     assert stats["soft_deleted"] == 0
     assert len(current_rows(engine, "widgets")) == 2
@@ -312,12 +313,12 @@ def test_search_range_incremental_no_deletion_detection():
     client = FakeSearchClient([{"id": 1}, {"id": 2}])
     start, end = date(2024, 1, 1), date(2024, 1, 1)
     sync_search_range(
-        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
+        SQLSink(engine), client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
     )
 
     client._rows = [{"id": 1}]
     stats = sync_search_range(
-        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
+        SQLSink(engine), client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "daily"
     )
     assert stats == {"fetched": 1, "inserted": 0, "updated": 0, "touched": 1}
 
@@ -331,7 +332,7 @@ def test_search_range_backfill_chunks_a_multi_week_span_by_7_days():
     client = FakeSearchClient([])
     start, end = date(2020, 1, 1), date(2020, 1, 31)  # 31 days -> 5 weekly chunks
     sync_search_range(
-        engine, client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "backfill"
+        SQLSink(engine), client, "widgets_busqueda", "fetch_widgets_busqueda", ("id",), start, end, "backfill"
     )
 
     calls = sorted(client.calls)

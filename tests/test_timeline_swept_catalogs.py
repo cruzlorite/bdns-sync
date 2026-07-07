@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import create_engine
 
 from bdns.sync.syncers import sync_organos, sync_organos_agrupacion, sync_reglamentos
+from bdns.sync.sinks.sql import SQLSink
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows, all_rows
 
@@ -36,19 +37,19 @@ def test_swept_catalog_day_by_day_timeline(sync_fn, attr, table, populated_value
 
     # Day 1: first run. Every sweep value is fetched (asserted below), but
     # only the populated one contributes rows.
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["inserted"] == len(baseline)
     assert len(current_rows(engine, table)) == len(baseline)
 
     # Day 2: no change, touch only
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["inserted"] == 0
     assert stats["updated"] == 0
     assert stats["touched"] == len(baseline)
 
     # Day 3: rewrite, one field changes on one row in the populated value
     getattr(client, attr)[populated_value][0][mutate_field] = "__MUTATED__"
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["updated"] == 1
     closed = [r for r in all_rows(engine, table) if not r["_is_current"]]
     assert len(closed) == 1
@@ -56,7 +57,7 @@ def test_swept_catalog_day_by_day_timeline(sync_fn, attr, table, populated_value
     # Day 4: deletion. Withdrawing a row from the populated value is a
     # full-reconciliation deletion like any other full-catalog entity.
     getattr(client, attr)[populated_value].pop()
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, table)) == len(baseline) - 1
 
@@ -66,7 +67,7 @@ def test_swept_catalog_day_by_day_timeline(sync_fn, attr, table, populated_value
     new_row = deepcopy(baseline[0])
     new_row["id"] = new_row["id"] + 999000
     getattr(client, attr)[empty_value].append(new_row)
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["inserted"] == 1
     assert stats["soft_deleted"] == 0  # the populated value's rows must be untouched
     assert len(current_rows(engine, table)) == before + 1
@@ -80,7 +81,7 @@ def test_swept_catalog_sweeps_every_declared_value(sync_fn, attr, table, populat
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_fn(engine, client)
+    sync_fn(SQLSink(engine), client)
 
     method = {
         "organos": "fetch_organos",

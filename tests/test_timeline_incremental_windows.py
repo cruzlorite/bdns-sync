@@ -34,6 +34,7 @@ from sqlalchemy import create_engine
 
 from bdns.sync.generic import CHUNK_DAYS, WINDOWS
 from bdns.sync.syncers import SEARCH_SYNCERS
+from bdns.sync.sinks.sql import SQLSink
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows
 
@@ -69,21 +70,21 @@ def test_cascade_progressively_reveals_older_registrations(endpoint, key_fields)
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
 
-    stats = sync_fn(engine, client, "daily")
+    stats = sync_fn(SQLSink(engine), client, "daily")
     assert stats["inserted"] == 1  # only reg_days_ago=0
     assert len(current_rows(engine, endpoint)) == 1
 
-    stats = sync_fn(engine, client, "weekly")
+    stats = sync_fn(SQLSink(engine), client, "weekly")
     assert stats["inserted"] == 1  # reg_days_ago=5 newly in range
     assert stats["touched"] == 1  # reg_days_ago=0 re-seen, unchanged
     assert len(current_rows(engine, endpoint)) == 2
 
-    stats = sync_fn(engine, client, "monthly")
+    stats = sync_fn(SQLSink(engine), client, "monthly")
     assert stats["inserted"] == 1  # reg_days_ago=20
     assert stats["touched"] == 2
     assert len(current_rows(engine, endpoint)) == 3
 
-    stats = sync_fn(engine, client, "annual")
+    stats = sync_fn(SQLSink(engine), client, "annual")
     assert stats["inserted"] == 1  # reg_days_ago=100
     assert stats["touched"] == 3
     assert len(current_rows(engine, endpoint)) == 4
@@ -101,7 +102,7 @@ def test_daily_and_weekly_miss_a_correction_only_monthly_catches(endpoint, key_f
 
     # seed the table with all four tiers first (one full cascade)
     for window in ("daily", "weekly", "monthly", "annual"):
-        sync_fn(engine, client, window)
+        sync_fn(SQLSink(engine), client, window)
     assert len(current_rows(engine, endpoint)) == 4
 
     # upstream corrects the reg_days_ago=20 record (mutate a non-key field)
@@ -110,13 +111,13 @@ def test_daily_and_weekly_miss_a_correction_only_monthly_catches(endpoint, key_f
     payload_field = next(k for k in target["payload"] if k not in key_fields and isinstance(target["payload"][k], str))
     target["payload"][payload_field] = "__CORRECTED__"
 
-    stats = sync_fn(engine, client, "daily")
+    stats = sync_fn(SQLSink(engine), client, "daily")
     assert stats.get("updated", 0) == 0  # correction is 20 days back, daily can't see it
 
-    stats = sync_fn(engine, client, "weekly")
+    stats = sync_fn(SQLSink(engine), client, "weekly")
     assert stats.get("updated", 0) == 0  # still can't see it, 20 > 7
 
-    stats = sync_fn(engine, client, "monthly")
+    stats = sync_fn(SQLSink(engine), client, "monthly")
     assert stats["updated"] == 1  # 20 <= 30, caught
 
     current = current_rows(engine, endpoint)
@@ -133,13 +134,13 @@ def test_partidospoliticos_never_reports_or_applies_deletions():
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS["partidospoliticos_busqueda"]
     for window in ("daily", "weekly", "monthly", "annual"):
-        sync_fn(engine, client, window)
+        sync_fn(SQLSink(engine), client, window)
     before = len(current_rows(engine, "partidospoliticos_busqueda"))
 
     records = client.partidospoliticos_busqueda
     records.remove(next(r for r in records if r["reg_days_ago"] == 0))
 
-    stats = sync_fn(engine, client, "daily")
+    stats = sync_fn(SQLSink(engine), client, "daily")
     assert "soft_deleted" not in stats
     assert len(current_rows(engine, "partidospoliticos_busqueda")) == before
 
@@ -154,13 +155,13 @@ def test_scoped_entities_detect_a_real_deletion_within_the_current_window(endpoi
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
-    sync_fn(engine, client, "daily")
+    sync_fn(SQLSink(engine), client, "daily")
     before = len(current_rows(engine, endpoint))
 
     records = getattr(client, endpoint)
     records.remove(next(r for r in records if r["reg_days_ago"] == 0))
 
-    stats = sync_fn(engine, client, "daily")
+    stats = sync_fn(SQLSink(engine), client, "daily")
     assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, endpoint)) == before - 1
 
@@ -176,13 +177,13 @@ def test_scoped_entities_ignore_records_outside_the_current_window(endpoint, key
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
-    sync_fn(engine, client, "monthly")  # seeds reg_days_ago 0, 5, 20
+    sync_fn(SQLSink(engine), client, "monthly")  # seeds reg_days_ago 0, 5, 20
     before = len(current_rows(engine, endpoint))
 
     records = getattr(client, endpoint)
     records.remove(next(r for r in records if r["reg_days_ago"] == 20))
 
-    stats = sync_fn(engine, client, "daily")  # only covers reg_days_ago=0
+    stats = sync_fn(SQLSink(engine), client, "daily")  # only covers reg_days_ago=0
     assert stats.get("soft_deleted", 0) == 0
     assert len(current_rows(engine, endpoint)) == before
 
@@ -192,7 +193,7 @@ def test_new_registration_is_caught_by_the_next_daily_run(endpoint, key_fields):
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
-    sync_fn(engine, client, "daily")
+    sync_fn(SQLSink(engine), client, "daily")
 
     records = getattr(client, endpoint)
     new_record = deepcopy(next(r for r in records if r["reg_days_ago"] == 0))
@@ -204,7 +205,7 @@ def test_new_registration_is_caught_by_the_next_daily_run(endpoint, key_fields):
         )
     records.append(new_record)
 
-    stats = sync_fn(engine, client, "daily")
+    stats = sync_fn(SQLSink(engine), client, "daily")
     assert stats["inserted"] == 1
 
 
@@ -230,7 +231,7 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
-    sync_fn(engine, client, window)
+    sync_fn(SQLSink(engine), client, window)
 
     inclusive = endpoint == "convocatorias_busqueda"
     method = f"fetch_{endpoint}"
@@ -273,7 +274,7 @@ def test_no_day_is_dropped_at_chunk_boundaries(endpoint, key_fields):
             payload[reg_field] = reg_date(days_ago).isoformat()
         records.append({"reg_days_ago": days_ago, "payload": payload})
 
-    stats = sync_fn(engine, client, "monthly")
+    stats = sync_fn(SQLSink(engine), client, "monthly")
     assert stats["inserted"] == 30  # not one day lost at any chunk boundary
     assert len(current_rows(engine, endpoint)) == 30
 
@@ -302,7 +303,7 @@ def test_backfill_since_until_range_fetches_the_whole_span(endpoint, key_fields)
 
     until = reg_date(1)  # yesterday
     since = reg_date(40)  # 40 days back, covers all four records
-    stats = sync_fn(engine, client, since=since, until=until)
+    stats = sync_fn(SQLSink(engine), client, since=since, until=until)
 
     assert stats["inserted"] == 4
     assert len(current_rows(engine, endpoint)) == 4

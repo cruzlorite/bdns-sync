@@ -21,8 +21,7 @@ from datetime import date, timedelta
 from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 from bdns.fetch import BDNSClient
-from bdns.sync.bookkeeping import run_with_bookkeeping
-from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
+from bdns.sync.sinks import Sink
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -86,22 +85,15 @@ def to_api_upper_bound(inclusive_end: date) -> date:
 
 
 def sync_full_catalog(
-    engine, client: BDNSClient, endpoint_name: str, fetch_method_name: str, key_fields: Sequence[str]
+    sink: Sink, client: BDNSClient, endpoint_name: str, fetch_method_name: str, key_fields: Sequence[str]
 ) -> Dict[str, int]:
     """Fetch everything with one no-arg call, full-reconcile every run."""
     fetch = getattr(client, fetch_method_name)
-    return run_with_bookkeeping(
-        engine,
-        endpoint_name,
-        run_type="full",
-        apply_fn=lambda conn, table, staging: apply_full_reconciliation(
-            conn, table, staging, fetch(), key_fields
-        ),
-    )
+    return sink.sync_full(endpoint_name, fetch(), key_fields)
 
 
 def sync_swept_catalog(
-    engine,
+    sink: Sink,
     client: BDNSClient,
     endpoint_name: str,
     fetch_method_name: str,
@@ -123,14 +115,7 @@ def sync_swept_catalog(
                 item[sweep_param] = value
                 yield item
 
-    return run_with_bookkeeping(
-        engine,
-        endpoint_name,
-        run_type="full",
-        apply_fn=lambda conn, table, staging: apply_full_reconciliation(
-            conn, table, staging, rows(), key_fields
-        ),
-    )
+    return sink.sync_full(endpoint_name, rows(), key_fields)
 
 
 def window_bounds(window: str) -> Tuple[date, date]:
@@ -164,7 +149,7 @@ def resolve_when(
 
 
 def sync_search_range(
-    engine,
+    sink: Sink,
     client: BDNSClient,
     endpoint_name: str,
     fetch_method_name: str,
@@ -198,11 +183,14 @@ def sync_search_range(
                 fechaRegInicio=chunk_start, fechaRegFin=to_api_upper_bound(chunk_end)
             )
 
-    return _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows)
+    return sink.sync_window(
+        endpoint_name, rows(), key_fields,
+        window_start=start, window_end=end, run_type=run_type, reg_date_field=reg_date_field,
+    )
 
 
 def sync_search_range_inclusive(
-    engine,
+    sink: Sink,
     client: BDNSClient,
     endpoint_name: str,
     fetch_method_name: str,
@@ -226,22 +214,8 @@ def sync_search_range_inclusive(
             logger.info("%s: chunk [%s .. %s]", endpoint_name, chunk_start, chunk_end)
             yield from fetch(fechaDesde=chunk_start, fechaHasta=chunk_end)
 
-    return _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows)
-
-
-def _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows):
-    return run_with_bookkeeping(
-        engine,
-        endpoint_name,
-        run_type=run_type,
-        apply_fn=lambda conn, table, staging: apply_incremental(
-            conn,
-            table,
-            staging,
-            rows(),
-            key_fields,
-            reg_date_field=reg_date_field,
-            window_start=start,
-            window_end=end,
-        ),
+    return sink.sync_window(
+        endpoint_name, rows(), key_fields,
+        window_start=start, window_end=end, run_type=run_type, reg_date_field=reg_date_field,
     )
+

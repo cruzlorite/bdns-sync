@@ -15,6 +15,7 @@ from copy import deepcopy
 import pytest
 from sqlalchemy import create_engine
 
+from bdns.sync.sinks.sql import SQLSink
 from bdns.sync.syncers import (
     sync_actividades,
     sync_beneficiarios,
@@ -77,7 +78,7 @@ def test_full_catalog_day_by_day_timeline(sync_fn, attr, table, key_fields, muta
     assert len(baseline) >= 2, "fixture needs >=2 rows to exercise update and delete independently"
 
     # Day 1: first run, every fetched row is new
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["fetched"] == len(baseline)
     assert stats["inserted"] == len(baseline)
     assert stats["updated"] == 0
@@ -85,13 +86,13 @@ def test_full_catalog_day_by_day_timeline(sync_fn, attr, table, key_fields, muta
     assert len(current_rows(engine, table)) == len(baseline)
 
     # Day 2: identical re-fetch, a pure no-op that only touches `_synced_at`
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats == {"fetched": len(baseline), "inserted": 0, "updated": 0, "touched": len(baseline), "soft_deleted": 0}
 
     # Day 3: upstream edits one field on one row. SCD2 rewrite: the old
     # version is closed out and the new version becomes current.
     getattr(client, attr)[0][mutate_field] = "__MUTATED__"
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["updated"] == 1
     assert stats["inserted"] == 0
     history = all_rows(engine, table)
@@ -107,13 +108,13 @@ def test_full_catalog_day_by_day_timeline(sync_fn, attr, table, key_fields, muta
     # Day 4: upstream withdraws the last row. Full reconciliation must
     # detect it as a deletion; no incremental pass could see this.
     getattr(client, attr).pop()
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, table)) == len(baseline) - 1
 
     # Day 5: a brand-new row is registered, a plain insert
     new_row = fresh_copy_with_new_key(baseline[1], key_fields)
     getattr(client, attr).append(new_row)
-    stats = sync_fn(engine, client)
+    stats = sync_fn(SQLSink(engine), client)
     assert stats["inserted"] == 1
     assert len(current_rows(engine, table)) == len(baseline)

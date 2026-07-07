@@ -70,7 +70,7 @@ Toda la lógica de sincronización usa SQL portable (subconsultas `EXISTS`/`NOT 
 | BigQuery | Verificado (en vivo, ciclo SCD2 completo) | Driver incluido como dependencia; ver más abajo |
 | PostgreSQL / MySQL | Compatible por diseño (SQL portable) | Requieren instalar su driver (`psycopg2`, `pymysql`, ...) |
 
-Las diferencias por motor se concentran en un único módulo de adaptadores, [`bdns/sync/dialects.py`](bdns/sync/dialects.py): el resto del código no distingue destinos. Para añadir soporte específico de otro motor basta con registrar un adaptador nuevo allí.
+El almacenamiento está detrás de una interfaz `Sink` ([`bdns/sync/sinks/`](bdns/sync/sinks/)): la capa de fetch entrega lotes de registros y el sink es dueño de todo lo demás (versionado SCD2, detección de bajas, registro de ejecuciones). La implementación actual es [`SQLSink`](bdns/sync/sinks/sql/__init__.py), que cubre cualquier motor con dialecto de SQLAlchemy; las diferencias por motor se concentran en sus adaptadores internos ([`bdns/sync/sinks/sql/dialects.py`](bdns/sync/sinks/sql/dialects.py)). Un futuro destino no SQL (p. ej. Parquet) sería otra implementación de `Sink`, sin tocar la capa de fetch.
 
 ### BigQuery
 
@@ -185,6 +185,7 @@ El diseño sigue el documento oficial ["Buenas prácticas API SNPSAP"](https://w
 - `partidospoliticos_busqueda` no tiene detección de bajas: a diferencia de las otras cuatro entidades incrementales, su payload no expone ningún campo de fecha de registro (verificado en vivo; ver [docs/api-behavior.md](docs/api-behavior.md#5-detección-de-bajas-acotada-por-ventana)).
 - Los registros individuales malformados se descartan con un aviso en el log (nivel WARNING), se contabilizan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto y contenido truncado a 200 caracteres, enlazados por `run_id`). Nunca se almacenan en las tablas sincronizadas: sin clave natural válida no pueden versionarse como una fila normal.
 - Los rangos de fechas de varios años solicitados en una sola llamada fallan de forma intermitente en el API (`ERR_MANTENIMIENTO_BBDD`). Por ello toda consulta se trocea en piezas de 7 días, incluida la carga histórica con `--since`; no es necesario trocear manualmente.
+- El staging no deduplica: si el mismo registro entra dos veces en el lote de una ejecución, produce dos versiones vigentes idénticas de la misma clave natural. El API y el troceado por fechas están verificados en vivo como libres de duplicados (8.086/8.086 claves distintas en una réplica exacta del fetch de producción), así que en operación normal no ocurre; el caso observado provino de un proceso zombi escribiendo en el staging de otra ejecución. Un `SELECT DISTINCT` preventivo en la inserción de versiones está pendiente como refuerzo.
 
 ## Desarrollo
 

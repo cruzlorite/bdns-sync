@@ -70,7 +70,7 @@ All sync logic uses portable SQL (correlated `EXISTS`/`NOT EXISTS` subqueries, n
 | BigQuery | Verified (live, full SCD2 cycle) | Driver bundled as a dependency; see below |
 | PostgreSQL / MySQL | Compatible by design (portable SQL) | Install the driver (`psycopg2`, `pymysql`, ...) |
 
-Per-engine differences are confined to a single adapter module, [`bdns/sync/dialects.py`](bdns/sync/dialects.py): the rest of the codebase does not distinguish targets. Supporting another engine's specifics means registering a new adapter there.
+Storage sits behind a `Sink` interface ([`bdns/sync/sinks/`](bdns/sync/sinks/)): the fetch layer hands over batches of records and the sink owns everything else (SCD2 versioning, deletion detection, run logging). The current implementation is [`SQLSink`](bdns/sync/sinks/sql/__init__.py), covering any engine with a SQLAlchemy dialect; per-engine differences are confined to its internal adapters ([`bdns/sync/sinks/sql/dialects.py`](bdns/sync/sinks/sql/dialects.py)). A future non-SQL target (e.g. Parquet) would be another `Sink` implementation, leaving the fetch layer untouched.
 
 ### BigQuery
 
@@ -185,6 +185,7 @@ The design follows the official ["Buenas prácticas API SNPSAP"](https://www.inf
 - `partidospoliticos_busqueda` has no deletion detection: unlike the other four incremental entities, its payload does not expose any registration-date field (verified live; see [docs/api-behavior.en.md](docs/api-behavior.en.md#5-window-scoped-deletion-detection)).
 - Individual malformed records are discarded with a log warning (WARNING level), counted in `_sync_runs.rows_skipped`, and recorded in `_sync_errors` (context plus content truncated to 200 characters, linked by `run_id`). They are never stored in the synced tables: without a valid natural key they cannot be versioned like a normal row.
 - Multi-year date ranges requested in a single call fail intermittently on the API side (`ERR_MANTENIMIENTO_BBDD`). For that reason every query is chunked into 7-day pieces, including the historical load with `--since`; no manual chunking is needed.
+- Staging does not deduplicate: if the same record enters a run's batch twice, it produces two identical current versions of the same natural key. The API and the date chunking are verified live as duplicate-free (8,086/8,086 distinct keys in an exact replica of the production fetch), so this does not happen in normal operation; the one observed case came from a zombie process writing into another run's staging. A preventive `SELECT DISTINCT` on version insertion is pending as hardening.
 
 ## Development
 

@@ -13,6 +13,7 @@ from sqlalchemy import create_engine
 
 from bdns.sync.generic import CHUNK_DAYS
 from bdns.sync.syncers import sync_convocatorias
+from bdns.sync.sinks.sql import SQLSink
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows, last_sync_run, sync_errors_for
 
@@ -21,16 +22,16 @@ def test_convocatorias_cascade_progressively_reveals_older_registrations():
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
 
-    stats = sync_convocatorias(engine, client, "daily")
+    stats = sync_convocatorias(SQLSink(engine), client, "daily")
     assert stats["inserted"] == 1  # only reg_days_ago=0 -> code 927266
     assert client.calls_to("fetch_convocatorias") == [{"numConv": "927266"}]
 
-    stats = sync_convocatorias(engine, client, "weekly")
+    stats = sync_convocatorias(SQLSink(engine), client, "weekly")
     assert stats["inserted"] == 1  # code 927267 (reg_days_ago=5) newly in range
     assert stats["touched"] == 1  # code 927266 re-discovered, unchanged
     assert len(current_rows(engine, "convocatorias")) == 2
 
-    stats = sync_convocatorias(engine, client, "monthly")
+    stats = sync_convocatorias(SQLSink(engine), client, "monthly")
     assert stats["inserted"] == 1  # code 927268 (reg_days_ago=20)
     assert stats["touched"] == 2
     assert len(current_rows(engine, "convocatorias")) == 3
@@ -44,7 +45,7 @@ def test_convocatorias_discovery_is_chunked_for_wide_windows():
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "monthly")
+    sync_convocatorias(SQLSink(engine), client, "monthly")
 
     # convocatorias' fechaHasta is INCLUSIVE, so a chunk spanning days [s, e]
     # is sent as (s, e) directly -- no +1, unlike the fechaRegFin endpoints
@@ -59,7 +60,7 @@ def test_convocatorias_discovery_is_chunked_for_wide_windows():
 def test_convocatorias_one_detail_call_per_discovered_code():
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "monthly")
+    sync_convocatorias(SQLSink(engine), client, "monthly")
     calls = client.calls_to("fetch_convocatorias")
     assert sorted(c["numConv"] for c in calls) == ["927266", "927267", "927268"]
 
@@ -67,10 +68,10 @@ def test_convocatorias_one_detail_call_per_discovered_code():
 def test_convocatorias_detail_rewrite_produces_new_version():
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "weekly")
+    sync_convocatorias(SQLSink(engine), client, "weekly")
 
     client.convocatorias_detail["927267"]["presupuestoTotal"] = 999999
-    stats = sync_convocatorias(engine, client, "weekly")
+    stats = sync_convocatorias(SQLSink(engine), client, "weekly")
     assert stats["updated"] == 1
     assert stats["touched"] == 1  # 927266 unchanged
 
@@ -88,7 +89,7 @@ def test_convocatorias_malformed_detail_is_skipped_not_crashed():
     client = FakeBDNSClient()
     client.convocatorias_detail["927266"] = "<html>not json</html>"
 
-    stats = sync_convocatorias(engine, client, "daily")
+    stats = sync_convocatorias(SQLSink(engine), client, "daily")
     assert stats["fetched"] == 0  # the only discovered code was malformed
     assert stats["inserted"] == 0
     assert len(current_rows(engine, "convocatorias")) == 0
@@ -108,13 +109,13 @@ def test_convocatorias_detects_a_real_deletion_within_the_current_window():
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "daily")
+    sync_convocatorias(SQLSink(engine), client, "daily")
     before = len(current_rows(engine, "convocatorias"))
 
     client.convocatorias_busqueda = [
         rec for rec in client.convocatorias_busqueda if rec["reg_days_ago"] != 0
     ]
-    stats = sync_convocatorias(engine, client, "daily")
+    stats = sync_convocatorias(SQLSink(engine), client, "daily")
     assert stats["soft_deleted"] == 1
     assert len(current_rows(engine, "convocatorias")) == before - 1
 
@@ -126,13 +127,13 @@ def test_convocatorias_ignores_codes_outside_the_current_window():
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "monthly")  # seeds reg_days_ago 0, 5, 20
+    sync_convocatorias(SQLSink(engine), client, "monthly")  # seeds reg_days_ago 0, 5, 20
     before = len(current_rows(engine, "convocatorias"))
 
     client.convocatorias_busqueda = [
         rec for rec in client.convocatorias_busqueda if rec["reg_days_ago"] != 20
     ]
-    stats = sync_convocatorias(engine, client, "daily")  # only covers reg_days_ago=0
+    stats = sync_convocatorias(SQLSink(engine), client, "daily")  # only covers reg_days_ago=0
     assert stats.get("soft_deleted", 0) == 0
     assert len(current_rows(engine, "convocatorias")) == before
 
@@ -140,7 +141,7 @@ def test_convocatorias_ignores_codes_outside_the_current_window():
 def test_convocatorias_new_registration_caught_by_daily():
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
-    sync_convocatorias(engine, client, "daily")
+    sync_convocatorias(SQLSink(engine), client, "daily")
 
     new_discovery = deepcopy(client.convocatorias_busqueda[0])
     new_discovery["payload"] = dict(new_discovery["payload"], numeroConvocatoria="927270")
@@ -149,5 +150,5 @@ def test_convocatorias_new_registration_caught_by_daily():
         client.convocatorias_detail["927266"], codigoBDNS="927270"
     )
 
-    stats = sync_convocatorias(engine, client, "daily")
+    stats = sync_convocatorias(SQLSink(engine), client, "daily")
     assert stats["inserted"] == 1

@@ -3,8 +3,8 @@ from datetime import date
 import pytest
 from sqlalchemy import MetaData, create_engine, select
 
-from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
-from bdns.sync.schema import build_staging_table, build_sync_table
+from bdns.sync.sinks.sql.scd2 import apply_full_reconciliation, apply_incremental
+from bdns.sync.sinks.sql.schema import build_staging_table, build_sync_table
 
 
 @pytest.fixture

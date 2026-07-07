@@ -11,7 +11,7 @@ from copy import deepcopy
 from typing import Any, Dict, Sequence
 
 from sqlalchemy import MetaData, desc, select
-from bdns.sync.schema import build_control_tables, build_sync_table
+from bdns.sync.sinks.sql.schema import build_control_tables, build_sync_table
 
 
 def current_rows(engine, name):

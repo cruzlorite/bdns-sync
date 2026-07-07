@@ -29,7 +29,6 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from bdns.fetch import BDNSClient, TipoAdministracion
 from bdns.fetch.types import Ambito
-from bdns.sync.bookkeeping import run_with_bookkeeping
 from bdns.sync.generic import (
     iter_date_chunks,
     resolve_when,
@@ -38,7 +37,6 @@ from bdns.sync.generic import (
     sync_search_range_inclusive,
     sync_swept_catalog,
 )
-from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -61,9 +59,9 @@ def _skip_malformed(
     over one bad record.
 
     When `errors` is given, each skip appends a `{"context", "content"}`
-    dict to it. The caller threads that list back through `stats` so
-    `run_with_bookkeeping` can persist it to `_sync_errors`, a durable
-    record that survives after the log scrolls away.
+    dict to it. The caller passes that list to the sink (`skipped=`), which
+    persists it to its error log, a durable record that survives after the
+    log scrolls away.
     """
     for item in items:
         if not isinstance(item, dict):
@@ -88,45 +86,45 @@ REGIONES_ENDPOINT = "regiones"
 SANCIONES_BUSQUEDA_ENDPOINT = "sanciones_busqueda"
 
 
-def sync_sectores(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, SECTORES_ENDPOINT, "fetch_sectores", ("id",))
+def sync_sectores(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, SECTORES_ENDPOINT, "fetch_sectores", ("id",))
 
 
-def sync_actividades(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, ACTIVIDADES_ENDPOINT, "fetch_actividades", ("id",))
+def sync_actividades(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, ACTIVIDADES_ENDPOINT, "fetch_actividades", ("id",))
 
 
-def sync_finalidades(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, FINALIDADES_ENDPOINT, "fetch_finalidades", ("id",))
+def sync_finalidades(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, FINALIDADES_ENDPOINT, "fetch_finalidades", ("id",))
 
 
-def sync_beneficiarios(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, BENEFICIARIOS_ENDPOINT, "fetch_beneficiarios", ("id",))
+def sync_beneficiarios(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, BENEFICIARIOS_ENDPOINT, "fetch_beneficiarios", ("id",))
 
 
-def sync_instrumentos(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, INSTRUMENTOS_ENDPOINT, "fetch_instrumentos", ("id",))
+def sync_instrumentos(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, INSTRUMENTOS_ENDPOINT, "fetch_instrumentos", ("id",))
 
 
-def sync_objetivos(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, OBJETIVOS_ENDPOINT, "fetch_objetivos", ("id",))
+def sync_objetivos(sink, client: BDNSClient) -> Dict[str, int]:
+    return sync_full_catalog(sink, client, OBJETIVOS_ENDPOINT, "fetch_objetivos", ("id",))
 
 
-def sync_convocatorias_ultimas(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_convocatorias_ultimas(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_full_catalog(
-        engine, client, CONVOCATORIAS_ULTIMAS_ENDPOINT, "fetch_convocatorias_ultimas", ("id",)
+        sink, client, CONVOCATORIAS_ULTIMAS_ENDPOINT, "fetch_convocatorias_ultimas", ("id",)
     )
 
 
-def sync_regiones(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_regiones(sink, client: BDNSClient) -> Dict[str, int]:
     # Tree-shaped, but still a single call. Unlike organos*, there's no idAdmon sweep here.
-    return sync_full_catalog(engine, client, REGIONES_ENDPOINT, "fetch_regiones", ("id",))
+    return sync_full_catalog(sink, client, REGIONES_ENDPOINT, "fetch_regiones", ("id",))
 
 
-def sync_sanciones_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_sanciones_busqueda(sink, client: BDNSClient) -> Dict[str, int]:
     # There's no real id field in the source, so this is a best-effort composite of 3 fields.
     return sync_full_catalog(
-        engine,
+        sink,
         client,
         SANCIONES_BUSQUEDA_ENDPOINT,
         "fetch_sanciones_busqueda",
@@ -141,15 +139,15 @@ ORGANOS_AGRUPACION_ENDPOINT = "organos_agrupacion"
 REGLAMENTOS_ENDPOINT = "reglamentos"
 
 
-def sync_organos(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_organos(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
-        engine, client, ORGANOS_ENDPOINT, "fetch_organos", "idAdmon", ADMIN_TYPES, ("idAdmon", "id")
+        sink, client, ORGANOS_ENDPOINT, "fetch_organos", "idAdmon", ADMIN_TYPES, ("idAdmon", "id")
     )
 
 
-def sync_organos_agrupacion(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_organos_agrupacion(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
-        engine,
+        sink,
         client,
         ORGANOS_AGRUPACION_ENDPOINT,
         "fetch_organos_agrupacion",
@@ -159,9 +157,9 @@ def sync_organos_agrupacion(engine, client: BDNSClient) -> Dict[str, int]:
     )
 
 
-def sync_reglamentos(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_reglamentos(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
-        engine,
+        sink,
         client,
         REGLAMENTOS_ENDPOINT,
         "fetch_reglamentos",
@@ -184,14 +182,14 @@ MINIMIS_BUSQUEDA_ENDPOINT = "minimis_busqueda"
 PARTIDOSPOLITICOS_BUSQUEDA_ENDPOINT = "partidospoliticos_busqueda"
 
 
-def sync_concesiones_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_concesiones_busqueda(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     # `fechaAlta` is the payload's own registration date, confirmed live
     # against 500+ rows across two date ranges. Passing it here lets this
     # sync detect real deletions, not just inserts and edits. See
-    # scd2.apply_incremental for how that comparison works.
+    # Sink.sync_window for how that comparison works.
     start, end, run_type = resolve_when(window, since, until)
     return sync_search_range(
-        engine,
+        sink,
         client,
         CONCESIONES_BUSQUEDA_ENDPOINT,
         "fetch_concesiones_busqueda",
@@ -203,10 +201,10 @@ def sync_concesiones_busqueda(engine, client: BDNSClient, window=None, *, since=
     )
 
 
-def sync_ayudasestado_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_ayudasestado_busqueda(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     start, end, run_type = resolve_when(window, since, until)
     return sync_search_range(
-        engine,
+        sink,
         client,
         AYUDASESTADO_BUSQUEDA_ENDPOINT,
         "fetch_ayudasestado_busqueda",
@@ -218,10 +216,10 @@ def sync_ayudasestado_busqueda(engine, client: BDNSClient, window=None, *, since
     )
 
 
-def sync_minimis_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_minimis_busqueda(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     start, end, run_type = resolve_when(window, since, until)
     return sync_search_range(
-        engine,
+        sink,
         client,
         MINIMIS_BUSQUEDA_ENDPOINT,
         "fetch_minimis_busqueda",
@@ -233,7 +231,7 @@ def sync_minimis_busqueda(engine, client: BDNSClient, window=None, *, since=None
     )
 
 
-def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_partidospoliticos_busqueda(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     # No `reg_date_field` here. Confirmed live, using 71 rows across two
     # date ranges six months apart, that this payload never carries a
     # registration-date field. The official doc claims this endpoint
@@ -243,7 +241,7 @@ def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window=None, *, 
     # documented in the README.
     start, end, run_type = resolve_when(window, since, until)
     return sync_search_range(
-        engine,
+        sink,
         client,
         PARTIDOSPOLITICOS_BUSQUEDA_ENDPOINT,
         "fetch_partidospoliticos_busqueda",
@@ -273,7 +271,7 @@ CONVOCATORIAS_KEY_FIELDS = ("codigoBDNS",)
 CONVOCATORIAS_BUSQUEDA_ENDPOINT = "convocatorias_busqueda"
 
 
-def sync_convocatorias_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_convocatorias_busqueda(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     """The discovery listing itself, stored like any other `_busqueda`
     incremental entity. Same window/reg-date machinery as `sync_convocatorias`,
     but this is a plain `sync_search_range` call, not the two-step flow:
@@ -302,7 +300,7 @@ def sync_convocatorias_busqueda(engine, client: BDNSClient, window=None, *, sinc
     """
     start, end, run_type = resolve_when(window, since, until)
     return sync_search_range_inclusive(
-        engine,
+        sink,
         client,
         CONVOCATORIAS_BUSQUEDA_ENDPOINT,
         "fetch_convocatorias_busqueda",
@@ -402,7 +400,7 @@ def fetch_convocatoria_details(
                 yield from _skip_malformed(items, f"convocatorias numConv={code}", errors)
 
 
-def sync_convocatorias(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+def sync_convocatorias(sink, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     """Two-step: discover codes for the reg-date range (`fechaDesde/Hasta`),
     then fetch full detail per code and apply incrementally.
 
@@ -413,26 +411,20 @@ def sync_convocatorias(engine, client: BDNSClient, window=None, *, since=None, u
     codes = discover_convocatoria_codes(client, start, end)
     errors: List[Dict[str, str]] = []
 
-    def apply_fn(conn, table, staging):
-        stats = apply_incremental(
-            conn,
-            table,
-            staging,
-            fetch_convocatoria_details(client, codes, errors),
-            CONVOCATORIAS_KEY_FIELDS,
-            # `fechaRecepcion` is the detail record's own registration date,
-            # confirmed live against 1000 rows across two date ranges. This
-            # enables window-scoped deletion detection, the same way as
-            # concesiones_busqueda.
-            reg_date_field="fechaRecepcion",
-            window_start=start,
-            window_end=end,
-        )
-        stats["skipped"] = len(errors)
-        stats["_skip_details"] = errors
-        return stats
-
-    return run_with_bookkeeping(engine, CONVOCATORIAS_ENDPOINT, run_type=run_type, apply_fn=apply_fn)
+    return sink.sync_window(
+        CONVOCATORIAS_ENDPOINT,
+        fetch_convocatoria_details(client, codes, errors),
+        CONVOCATORIAS_KEY_FIELDS,
+        window_start=start,
+        window_end=end,
+        run_type=run_type,
+        # `fechaRecepcion` is the detail record's own registration date,
+        # confirmed live against 1000 rows across two date ranges. This
+        # enables window-scoped deletion detection, the same way as
+        # concesiones_busqueda.
+        reg_date_field="fechaRecepcion",
+        skipped=errors,
+    )
 
 
 # --- grandesbeneficiarios: two tables for one entity ----------------------
@@ -447,9 +439,9 @@ GRANDESBENEFICIARIOS_BUSQUEDA_ENDPOINT = "grandesbeneficiarios_busqueda"
 GRANDESBENEFICIARIOS_KEY_FIELDS = ("idPersona", "ejercicio")
 
 
-def sync_grandesbeneficiarios_anios(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_grandesbeneficiarios_anios(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_full_catalog(
-        engine,
+        sink,
         client,
         GRANDESBENEFICIARIOS_ANIOS_ENDPOINT,
         "fetch_grandesbeneficiarios_anios",
@@ -457,19 +449,12 @@ def sync_grandesbeneficiarios_anios(engine, client: BDNSClient) -> Dict[str, int
     )
 
 
-def sync_grandesbeneficiarios_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_grandesbeneficiarios_busqueda(sink, client: BDNSClient) -> Dict[str, int]:
     anios = [item["id"] for item in client.fetch_grandesbeneficiarios_anios()]
-    return run_with_bookkeeping(
-        engine,
+    return sink.sync_full(
         GRANDESBENEFICIARIOS_BUSQUEDA_ENDPOINT,
-        run_type="full",
-        apply_fn=lambda conn, table, staging: apply_full_reconciliation(
-            conn,
-            table,
-            staging,
-            client.fetch_grandesbeneficiarios_busqueda(anios=anios),
-            GRANDESBENEFICIARIOS_KEY_FIELDS,
-        ),
+        client.fetch_grandesbeneficiarios_busqueda(anios=anios),
+        GRANDESBENEFICIARIOS_KEY_FIELDS,
     )
 
 
@@ -489,9 +474,9 @@ PLANESESTRATEGICOS_VIGENCIA_ENDPOINT = "planesestrategicos_vigencia"
 PLANESESTRATEGICOS_KEY_FIELDS = ("idPES",)
 
 
-def sync_planesestrategicos_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_planesestrategicos_busqueda(sink, client: BDNSClient) -> Dict[str, int]:
     return sync_full_catalog(
-        engine,
+        sink,
         client,
         PLANESESTRATEGICOS_BUSQUEDA_ENDPOINT,
         "fetch_planesestrategicos_busqueda",
@@ -525,35 +510,27 @@ def fetch_pes_vigencias(
             yield item
 
 
-def sync_planesestrategicos(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_planesestrategicos(sink, client: BDNSClient) -> Dict[str, int]:
     ids = discover_pes_ids(client)
     errors: List[Dict[str, str]] = []
 
-    def apply_fn(conn, table, staging):
-        stats = apply_full_reconciliation(
-            conn, table, staging, fetch_pes_details(client, ids, errors), PLANESESTRATEGICOS_KEY_FIELDS
-        )
-        stats["skipped"] = len(errors)
-        stats["_skip_details"] = errors
-        return stats
-
-    return run_with_bookkeeping(engine, PLANESESTRATEGICOS_ENDPOINT, run_type="full", apply_fn=apply_fn)
+    return sink.sync_full(
+        PLANESESTRATEGICOS_ENDPOINT,
+        fetch_pes_details(client, ids, errors),
+        PLANESESTRATEGICOS_KEY_FIELDS,
+        skipped=errors,
+    )
 
 
-def sync_planesestrategicos_vigencia(engine, client: BDNSClient) -> Dict[str, int]:
+def sync_planesestrategicos_vigencia(sink, client: BDNSClient) -> Dict[str, int]:
     ids = discover_pes_ids(client)
     errors: List[Dict[str, str]] = []
 
-    def apply_fn(conn, table, staging):
-        stats = apply_full_reconciliation(
-            conn, table, staging, fetch_pes_vigencias(client, ids, errors), PLANESESTRATEGICOS_KEY_FIELDS
-        )
-        stats["skipped"] = len(errors)
-        stats["_skip_details"] = errors
-        return stats
-
-    return run_with_bookkeeping(
-        engine, PLANESESTRATEGICOS_VIGENCIA_ENDPOINT, run_type="full", apply_fn=apply_fn
+    return sink.sync_full(
+        PLANESESTRATEGICOS_VIGENCIA_ENDPOINT,
+        fetch_pes_vigencias(client, ids, errors),
+        PLANESESTRATEGICOS_KEY_FIELDS,
+        skipped=errors,
     )
 
 
@@ -580,7 +557,7 @@ FULL_SYNCERS = {
     PLANESESTRATEGICOS_VIGENCIA_ENDPOINT: sync_planesestrategicos_vigencia,
 }
 
-# endpoint name -> sync(engine, client, window)
+# endpoint name -> sync(sink, client, window)
 SEARCH_SYNCERS = {
     CONCESIONES_BUSQUEDA_ENDPOINT: sync_concesiones_busqueda,
     AYUDASESTADO_BUSQUEDA_ENDPOINT: sync_ayudasestado_busqueda,

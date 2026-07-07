@@ -24,8 +24,8 @@ from typing import Callable, Dict
 from sqlalchemy import MetaData, insert, update
 from sqlalchemy.engine import Engine
 
-from bdns.sync.dialects import get_adapter
-from bdns.sync.schema import build_control_tables, build_staging_table, build_sync_table
+from bdns.sync.sinks.sql.dialects import get_adapter
+from bdns.sync.sinks.sql.schema import build_control_tables, build_staging_table, build_sync_table
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
