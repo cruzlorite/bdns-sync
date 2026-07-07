@@ -5,11 +5,33 @@
 
 [🇪🇸 Spanish version](./README.md)
 
-Sync engine that keeps a versioned (SCD2) copy of the [BDNS REST API](https://www.infosubvenciones.es/bdnstrans/api).
+Sync engine that maintains a local, versioned (SCD2) copy of the [Spanish National Subsidies Database (BDNS) REST API](https://www.infosubvenciones.es/bdnstrans/api).
 
-[`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) implements an interface for extracting the data, `bdns-sync` provides a storage layer on top of `bdns-fetch`.
+It builds on [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch), which implements data extraction from the API; `bdns-sync` adds the storage layer: historical versioning, change and deletion detection, and run logging.
 
-A pure tool: one endpoint per invocation, no config file. Cadence lives in [`scripts/cron_dispatch.sh`](scripts/cron_dispatch.sh).
+It is a single-purpose tool: each invocation syncs one endpoint, with no configuration file. Scheduling cadence lives in [`scripts/delta_load.sh`](scripts/delta_load.sh).
+
+## Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Target databases](#target-databases)
+- [Scheduled operation](#scheduled-operation)
+- [Data model](#data-model)
+- [Endpoint types](#endpoint-types)
+- [Date windows and historical load](#date-windows-and-historical-load)
+- [Official good practices](#official-good-practices)
+- [Known limitations](#known-limitations)
+- [Development](#development)
+- [Legal notice](#legal-notice)
+- [License and links](#license-and-links)
+
+## Requirements
+
+- Python 3.11 to 3.14
+- [Poetry](https://python-poetry.org/)
+- A SQLAlchemy-compatible target database (see [Target databases](#target-databases))
 
 ## Installation
 
@@ -21,69 +43,102 @@ poetry install
 
 ## Usage
 
+The target is configured through the `BDNS_SYNC_TARGET_URL` environment variable (a SQLAlchemy URL):
+
 ```bash
 export BDNS_SYNC_TARGET_URL="bigquery://project/dataset"   # or postgresql://..., sqlite:///...
+```
 
-bdns-sync list --kind full              # full-replace entities
-bdns-sync list --kind search            # incremental entities
-bdns-sync sync sectores                 # sync one entity
-bdns-sync sync concesiones_busqueda --window daily           # cascade window
-bdns-sync sync concesiones_busqueda --since 2020-01-01        # historical backfill (through yesterday)
+Main commands:
+
+```bash
+bdns-sync list --kind full                                    # list full-replace entities
+bdns-sync list --kind search                                  # list incremental entities
+bdns-sync sync sectores                                       # sync a catalog entity
+bdns-sync sync concesiones_busqueda --window daily            # incremental window sync
+bdns-sync sync concesiones_busqueda --since 2020-01-01        # historical load (through yesterday)
 bdns-sync sync concesiones_busqueda --since 2020-01-01 --until 2020-12-31
 ```
 
-Via cron, one line (daily/weekly/monthly/annual cadence):
+## Target databases
+
+All sync logic uses portable SQL (correlated `EXISTS`/`NOT EXISTS` subqueries, no engine-specific `MERGE` or `UPDATE ... FROM`), so any database with a SQLAlchemy dialect works as a target. Verified:
+
+| Target | Status | Notes |
+|---|---|---|
+| SQLite | Verified (full test suite) | No extra setup |
+| BigQuery | Verified (live, full SCD2 cycle) | Driver bundled as a dependency; see below |
+| PostgreSQL / MySQL | Compatible by design (portable SQL) | Install the driver (`psycopg2`, `pymysql`, ...) |
+
+Per-engine differences are confined to a single adapter module, [`bdns/sync/dialects.py`](bdns/sync/dialects.py): the rest of the codebase does not distinguish targets. Supporting another engine's specifics means registering a new adapter there.
+
+### BigQuery
+
+```bash
+export BDNS_SYNC_TARGET_URL="bigquery://<project>/<dataset>"
+```
+
+- **Authentication**: application default credentials (`gcloud auth application-default login`) or a service account via `GOOGLE_APPLICATION_CREDENTIALS`.
+- **Minimum permissions**: `roles/bigquery.dataEditor` on the dataset and `roles/bigquery.jobUser` on the project.
+- **Indexes**: BigQuery has no secondary indexes; the adapter skips them and tables are created with `CLUSTER BY (_natural_key, _is_current)` instead, the columns every SCD2 diff filters on.
+
+## Scheduled operation
+
+Continuous operation requires a single cron line. The `delta_load.sh` script decides internally which entities and windows to run each day (daily, weekly, monthly, and annual cadence):
 
 ```
-0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/repo/scripts/cron_dispatch.sh
+0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/repo/scripts/delta_load.sh
 ```
 
-Initial historical load (once, before starting the cron):
+Before starting the cron job, run the initial historical load once:
 
 ```
 BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/repo/scripts/full_load.sh
 ```
 
+The load is idempotent: re-running it does not duplicate data.
+
 ## Data model
 
-Each synced endpoint has its own table, and they all share the same generic schema -- no per-endpoint fields. The original record goes into `payload` whole; everything else is SCD2 control columns:
+Each synced endpoint has its own table, and all tables share the same generic schema, with no endpoint-specific fields. The original record is stored whole in `payload`; the remaining columns are SCD2 control columns:
 
-| Column | What for |
+| Column | Description |
 |---|---|
-| `_id` | Autoincrement PK, internal only |
-| `_natural_key` | The record's business key (JSON of the key fields; see the entity tables below) |
-| `_row_hash` | SHA-256 of the canonical payload, so a change is detected without comparing field by field |
-| `_valid_from` / `_valid_to` | This version's validity span. `_valid_to` is `NULL` while it's the current version |
-| `_is_current` | `True` on the live version of each natural key |
-| `_synced_at` | Last time this version was seen at the source (bumped even when nothing changed) |
-| `_reg_date` | The payload's own registration date. Only populated for entities with window-scoped deletion detection (see below); `NULL` for the rest |
-| `payload` | JSON with the full record exactly as the API returns it |
+| `_natural_key` | The record's business key (JSON of the key fields; see the entity tables below). Together with `_valid_from` it identifies each version |
+| `_row_hash` | SHA-256 of the canonical payload; detects changes without comparing field by field |
+| `_valid_from` / `_valid_to` | Validity span of this version. `_valid_to` is `NULL` while it is the current version |
+| `_is_current` | `True` on the current version of each natural key |
+| `_synced_at` | Last time this version was observed at the source (updated even when nothing changed) |
+| `_reg_date` | The payload's own registration date. Only populated for entities with window-scoped deletion detection; `NULL` otherwise |
+| `payload` | The full record exactly as returned by the API, serialized as JSON (text column, portable across engines) |
 
-If the API adds or drops a field, no migration needed: caught by hash, versioned like any other change.
+If the API adds or removes a field, no migration is required: the change is detected via the hash and versioned like any other.
 
-**Control tables** (shared across all endpoints, `_sync_` prefix):
+### Control tables
 
-- **`_sync_state`** -- one row per table, the watermark: `table_name`, `last_synced_at`, `last_run_id`.
-- **`_sync_runs`** -- append-only log of every run: `run_id`, `table_name`, `run_type` (`full` or `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, and the counters `rows_fetched`, `rows_inserted`, `rows_soft_deleted`, `rows_skipped`.
-- **`_sync_errors`** -- one row per skipped malformed record: `error_id`, `run_id`, `table_name`, `context`, `content` (truncated to 200 chars), `occurred_at`. See [Known limitations](#known-limitations).
+Shared across all endpoints, with the `_sync_` prefix:
+
+- **`_sync_state`**: one row per table, holding the watermark: `table_name`, `last_synced_at`, `last_run_id`.
+- **`_sync_runs`**: append-only log of every run: `run_id`, `table_name`, `run_type` (`full` or `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, and the counters `rows_fetched`, `rows_inserted`, `rows_soft_deleted`, and `rows_skipped`.
+- **`_sync_errors`**: one row per discarded malformed record: `error_id`, `run_id`, `table_name`, `context`, `content` (truncated to 200 characters), `occurred_at`. See [Known limitations](#known-limitations).
 
 ## Endpoint types
 
-Two families, driven by volume.
+There are two families, determined by data volume.
 
 ### Full replace (`bdns-sync sync <entity>`)
 
-Small catalogs -- fetching everything every time is cheap.
+Small catalogs, where fetching the complete set on every run is affordable.
 
-| Shape | Why | Entities |
+| Shape | Reason | Entities |
 |---|---|---|
-| Simple | One call, no params | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones` |
-| Swept | The API doesn't return the union if you omit the param -- has to request each value and merge into one table | `organos`/`organos_agrupacion` (sweep `idAdmon`), `reglamentos` (sweeps `ambito`), `sanciones_busqueda` |
-| Discover-then-detail | The listing doesn't carry every field | `planesestrategicos_busqueda`/`planesestrategicos`/`planesestrategicos_vigencia`, `grandesbeneficiarios_anios`/`grandesbeneficiarios_busqueda` |
+| Simple | A single call, no parameters | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones` |
+| Swept | The API does not return the union when the parameter is omitted; each value must be queried and the results merged into one table | `organos`/`organos_agrupacion` (sweep `idAdmon`), `reglamentos` (sweeps `ambito`), `sanciones_busqueda` |
+| Discover-then-detail | The listing does not include every field | `planesestrategicos_busqueda`/`planesestrategicos`/`planesestrategicos_vigencia`, `grandesbeneficiarios_anios`/`grandesbeneficiarios_busqueda` |
 
 ### Registration-date incremental (`bdns-sync sync <entity> --window {daily,weekly,monthly,annual}`)
 
-Tens of millions of rows -- fetching them whole every time isn't viable.
+Endpoints with tens of millions of rows, where full replacement is not viable.
 
 | Entity | Natural key |
 |---|---|
@@ -91,66 +146,45 @@ Tens of millions of rows -- fetching them whole every time isn't viable.
 | `ayudasestado_busqueda` | `idConcesion` |
 | `minimis_busqueda` | `idConcesion` |
 | `partidospoliticos_busqueda` | `id` |
+| `convocatorias_busqueda` | `numeroConvocatoria` |
 | `convocatorias` | `codigoBDNS` |
 
-Registration date doesn't change when a record is edited, so re-querying the same window later won't find new additions, but will catch edits via hash. Corrections cluster near registration time and taper off with age, hence the cascade: `daily` always runs, `weekly`/`monthly`/`annual` are *extra* checks the same day, not replacements for it.
+`convocatorias` is a two-step case: discovery queries the `convocatorias_busqueda` listing by date range to collect the codes registered in the window, and each discovered code is then fetched in full through the detail endpoint (`convocatorias`, by `numConv`). The detail record is what gets versioned into the `convocatorias` table; the discovery listing is also synced as its own table, `convocatorias_busqueda`, through the same incremental machinery as the rest of this section.
 
-#### How date windows are queried (real API behavior)
+`convocatorias_busqueda` does **not** replace `convocatorias`: the listing carries only 10 of the ~30 detail fields (no budget, application dates, documents, instruments, etc.), and its hash staying the same says nothing about whether a detail-only field changed. Never use the listing to decide whether a code's detail fetch can be skipped.
 
-This part gathers several findings confirmed live against the API. They're documented in detail because they're subtle, absent from (or contradicted by) the official docs, and getting them wrong silently loses data.
+The detail step of `convocatorias` is the expensive one: one real API call per discovered code, with no pagination possible (a single call returns a single record). Measured live with a real month (May 2026, 6,186 codes), running it sequentially took anywhere from 23 minutes to 3 h 12 min depending on server load. The detail step is parallelized (8 workers, request starts paced at ~9.5 req/s, just under the 10/s cap) to approach the official rate limit instead of being bound to single-connection latency; the same month took 10 min 54 s in parallel, with zero `429`s.
 
-**1. A window is a day range inclusive on both ends.** `daily` for day `X` means "registrations from `X`". The upper end of every window is *yesterday* (`date.today() - 1`), because "today"'s data isn't final until the next morning.
+A record's registration date does not change when the record is edited, so re-querying the same window later finds no new additions, but does detect edits via the hash. Corrections cluster near the registration date and taper off with age; hence the window cascade: `daily` always runs, and `weekly`/`monthly`/`annual` are additional same-day checks, not replacements for the daily run.
 
-**2. The API's upper bound has OPPOSITE semantics depending on the endpoint.** There are two families of date parameters, and they behave inversely:
+## Date windows and historical load
 
-| Family | Parameters | Endpoints | Upper bound | Live check (day `D`) |
-|---|---|---|---|---|
-| Registration-date search | `fechaRegInicio` / `fechaRegFin` | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | **exclusive** (excludes day `D`) | `fechaRegFin=D` → ~0 rows for `D`; `fechaRegFin=D+1` → full day `D` (concesiones: 1 vs 58,488) |
-| Convocatorias discovery | `fechaDesde` / `fechaHasta` | `convocatorias` (discovery step) | **inclusive** (includes day `D`) | `fechaHasta=D` → every convocatoria with `fechaRecepcion == D`; `fechaHasta=D+1` → days `D` and `D+1` |
+Date handling against the API involves several subtleties verified live, documented in detail in [docs/api-behavior.en.md](docs/api-behavior.en.md). Summary:
 
-The bridge from our inclusive convention to the exclusive family lives in one named place, `generic.to_api_upper_bound(inclusive_end)`, which adds a day. Convocatorias does **not** use it: its `fechaHasta` is already inclusive, so adding a day would pull in convocatorias from outside the window. Had this gone unnoticed: `daily` for the four `fechaReg` endpoints would fetch almost nothing, and every wider window would drop its most recent day (and once chunked, one day per chunk boundary -- a 28-day range chunked by day returned 8 rows instead of ~1.2M).
+- A window is a day range inclusive on both ends; the upper end is always yesterday.
+- The API has two families of date parameters with **opposite** upper-bound semantics (exclusive for `fechaRegFin`, inclusive for `fechaHasta`). The conversion is centralized in `generic.to_api_upper_bound`.
+- Every window is chunked into pieces of at most 7 days before being queried, for reliability and speed. The result does not depend on chunk size.
+- Boundary correctness (no overlaps and no gaps between consecutive days) is verified live across all 5 entities and fixed as a permanent test.
+- Four of the five incremental entities also detect real deletions, by comparing the fetched data against the table rows whose registration date falls in the same range.
 
-**3. Every window is split into pieces of at most 7 days before being fetched** (`generic.iter_date_chunks`). `daily`/`weekly` already fit in one piece, unchanged; `monthly`/`annual` get chunked. Two reasons, both confirmed live against `concesiones_busqueda`:
+The cascade windows reach at most 365 days back. For a full historical load, use `--since DATE [--until DATE]`, which runs through exactly the same machinery. The available historical depth depends on the API's retention per endpoint, from ~4 years (`concesiones_busqueda`) to ~12 (`convocatorias`); [`scripts/full_load.sh`](scripts/full_load.sh) already includes conservative per-entity start dates. See the full table in [docs/api-behavior.en.md](docs/api-behavior.en.md#6-historical-depth-per-endpoint).
 
-- **Reliability**: a 4-year range (27.4M rows) returns `ERR_MANTENIMIENTO_BBDD` intermittently at any page depth; a one-week window over the same dates didn't fail once in 6 tries.
-- **Speed**: a single 30-day call took 286.7s; the same range chunked into weeks took 142.5s, both with zero errors.
+## Official good practices
 
-Because the date bridge is applied per piece, **the result doesn't depend on chunk size**: a 14-day `partidospoliticos_busqueda` range returns exactly the same 36 rows chunked into 1-, 7-, or 14-day pieces (confirmed live). The 7-day size isn't speed-critical either: measuring a fixed 14-day `concesiones` range (~530k rows), 1/3/7/14-day chunks took 51/41/47/57s -- differences within live-load noise, zero errors at any size. 7 days is the balance kept: fast, reliable, and it lines up with the weekly window.
+The design follows the official ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf) document:
 
-**4. Belt-and-suspenders check of the boundaries.** To rule out both an overlap (fetching one day too many) and a gap (dropping a day), it was confirmed live, across all 5 entities, that two adjacent days `X` and `X+1` -- fetched through the real production path with the correct per-family bridge -- satisfy: `fetch(X)` and `fetch(X+1)` are disjoint (zero overlap), and their union is exactly `fetch([X, X+1])`. The counts add up to the row: for `concesiones`, 115,862 + 68,457 = 184,319 rows, no overlap. One extra `+1` (on the exclusive family) or a wrong bound (on the inclusive one) would have double-counted the boundary day; a dropped day would have broken the union. The invariant is locked in as a permanent test (`test_generic.py`).
-
-**Window-scoped deletion detection**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, and `convocatorias` also detect real deletions, by comparing, within the same run, what was fetched against the table rows whose own registration date (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, depending on the entity) falls in that same range. This is never compared against the previous run, since that would produce constant false positives: every row eventually ages out of a rolling window regardless of deletion. `partidospoliticos_busqueda` is excluded: confirmed live that its payload never exposes a registration-date field, despite the official doc claiming it "works the same, same filters and results" as `concesiones_busqueda`. It doesn't. This is a real, permanent limitation unless the API changes.
-
-#### Historical load
-
-The cascade windows only reach 365 days back (`annual`). For a full historical load, use `--since DATE [--until DATE]`, which syncs an explicit date range through exactly the same machinery (7-day chunking, per-family date bridge, deletion detection scoped to the range). How far back a full load goes is set by what the API retains per endpoint -- measured live:
-
-| Entity | Data goes back | Bounded by |
-|---|---|---|
-| `concesiones_busqueda` | ~4 years | 4 calendar-year retention |
-| `partidospoliticos_busqueda` | ~4 years | (tracks concesiones) |
-| `ayudasestado_busqueda` | ~9-10 years | 10-year retention |
-| `minimis_busqueda` | ~10 years | 10-year retention |
-| `convocatorias` | ~12 years | portal start (~2014) |
-
-These dates are **not** in the code: `bdns-sync` is a pure primitive, it doesn't know how much history each endpoint has. Just as `cron_dispatch.sh` owns the cadence, [`scripts/full_load.sh`](scripts/full_load.sh) owns the start dates and passes them via `--since`. Asking for dates before the retention just returns empty weeks (one cheap call each), so the script's dates are conservative floors, not exact firsts. The load is idempotent: re-running it duplicates nothing (SCD2 just touches already-synced records).
-
-## Good practices followed (official)
-
-Per the official ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf):
-
-- **10 requests/second per IP limit**, enforced by `bdns-fetch`.
-- **Max page size** (10,000 records/call).
-- **Daily/weekly/monthly/annual cadence by registration date**: official recommendation, not our own design.
-- **`terceros` unused**: the document itself flags it as redundant.
-- **Full reconciliation to catch removals**: grants are withdrawn from BDNS the 4 calendar years following the grant; full-catalog syncs detect that by comparing against the entire current state. For the big incremental endpoints, where comparing against 20M+ rows every run isn't viable, a registration-date-scoped comparison is used instead (see above).
+- **10 requests per second per IP limit**, enforced by `bdns-fetch`.
+- **Maximum page size** (10,000 records per call).
+- **Daily/weekly/monthly/annual cadence by registration date**, as the document recommends.
+- **The `terceros` endpoint is not used**: the document itself flags it as redundant.
+- **Reconciliation to detect removals**: grants are withdrawn from the BDNS 4 calendar years after being awarded. Full-catalog syncs detect removals by comparing against the entire current state; for the large incremental endpoints, where that comparison is not viable, a registration-date-scoped comparison is used instead (see [docs/api-behavior.en.md](docs/api-behavior.en.md#5-window-scoped-deletion-detection)).
 
 ## Known limitations
 
-- `organos_codigo` / `organos_codigoadmin` not implemented (group H).
-- `partidospoliticos_busqueda` has no deletion detection: unlike the other 4 incremental entities, its payload never exposes a registration-date field (confirmed live with 70+ real rows across two different date ranges).
-- Individual malformed records are skipped with a log (WARNING level), counted in `_sync_runs.rows_skipped`, and recorded in `_sync_errors` (context plus content truncated to 200 characters, linked by `run_id`). They're never stored in the synced tables: a malformed record has no real natural key, so it can't be versioned like a normal row.
-- A multi-year range requested in **one call** fails intermittently: tested live (4 years, `concesiones_busqueda`, 27.4M rows), the API returns `ERR_MANTENIMIENTO_BBDD` at any page depth, while a one-week window over the same dates didn't fail once in 6 tries. That's why everything is chunked to 7 days; the historical load (`--since`, see [Historical load](#historical-load)) inherits that chunking, so there's no need to request wide ranges by hand.
+- `organos_codigo` and `organos_codigoadmin` are not implemented (group H).
+- `partidospoliticos_busqueda` has no deletion detection: unlike the other four incremental entities, its payload does not expose any registration-date field (verified live; see [docs/api-behavior.en.md](docs/api-behavior.en.md#5-window-scoped-deletion-detection)).
+- Individual malformed records are discarded with a log warning (WARNING level), counted in `_sync_runs.rows_skipped`, and recorded in `_sync_errors` (context plus content truncated to 200 characters, linked by `run_id`). They are never stored in the synced tables: without a valid natural key they cannot be versioned like a normal row.
+- Multi-year date ranges requested in a single call fail intermittently on the API side (`ERR_MANTENIMIENTO_BBDD`). For that reason every query is chunked into 7-day pieces, including the historical load with `--since`; no manual chunking is needed.
 
 ## Development
 
@@ -160,11 +194,11 @@ poetry run bdns-sync --help
 make test
 ```
 
-## Legal disclaimer
+## Legal notice
 
-Unofficial project, not affiliated with the Base de Datos Nacional de Subvenciones (BDNS) or Spain's Ministry of Finance. Distributed under the GPL v3, which expressly disclaims any warranty: use it at your own risk, with no warranty of any kind, and no liability accepted by the author for damages, data loss, or misuse.
+Unofficial project, not affiliated with the Base de Datos Nacional de Subvenciones (BDNS) or Spain's Ministerio de Hacienda. Distributed under the GPL v3, which expressly disclaims any warranty: use is at your own risk, with no warranty of any kind and no liability accepted by the author for damages, data loss, or misuse.
 
-The synced data comes from the [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) and is subject to its own [legal notice](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) and [API good-practices document](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf). Check them before redistributing anything extracted.
+The synced data comes from the [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) and is subject to its own [legal notice](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) and to the [API good-practices document](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf).
 
 ## License and links
 

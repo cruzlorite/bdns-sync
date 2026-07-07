@@ -195,9 +195,11 @@ def test_full_catalog_writes_rows_and_run_log():
         state_row = conn.execute(
             select(sync_state).where(sync_state.c.table_name == "widgets")
         ).mappings().one()
-        assert state_row["last_run_id"] == 1
         run_row = conn.execute(select(sync_runs)).mappings().one()
         assert run_row["status"] == "success"
+        # run_id is app-generated (epoch microseconds), not autoincrement;
+        # the watermark must point at the run that was just logged.
+        assert state_row["last_run_id"] == run_row["run_id"]
 
 
 def test_full_catalog_second_run_detects_deletion():

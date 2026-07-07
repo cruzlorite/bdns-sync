@@ -4,12 +4,12 @@
 # knowledge -- bdns-sync itself is a pure parameterized tool with no config
 # file and no idea what day it is. One crontab line calls this once a day:
 #
-#   0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/scripts/cron_dispatch.sh
+#   0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/scripts/delta_load.sh
 #
 # Windows cascade, they don't replace each other: daily always runs, and
 # weekly/monthly/annual are *additional* re-verification passes on the same
 # day (e.g. Jan 1st on a Sunday runs daily + weekly + monthly + annual, all
-# in the same invocation), per docs/sync-strategy.md.
+# in the same invocation), per the "Endpoint types" section of the README.
 set -euo pipefail
 
 : "${BDNS_SYNC_TARGET_URL:?set BDNS_SYNC_TARGET_URL to the target DB URL}"
@@ -40,6 +40,7 @@ run_window() {
   bdns-sync sync ayudasestado_busqueda --window "$window"
   bdns-sync sync minimis_busqueda --window "$window"
   bdns-sync sync partidospoliticos_busqueda --window "$window"
+  bdns-sync sync convocatorias_busqueda --window "$window"
   bdns-sync sync convocatorias --window "$window"
 }
 

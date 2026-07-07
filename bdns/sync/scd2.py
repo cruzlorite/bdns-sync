@@ -28,14 +28,18 @@ vendor-specific UPDATE...FROM or MERGE syntax. That's what lets the same
 code path run unchanged on SQLite, Postgres, MySQL, and BigQuery.
 """
 
+import logging
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence
 
-from sqlalchemy import and_, delete, exists, func, insert, literal, or_, select, update
+from sqlalchemy import and_, delete, exists, func, insert, literal, or_, select, true, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.schema import Table
 
 from bdns.sync.hashing import natural_key, row_hash
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def apply_full_reconciliation(
@@ -116,8 +120,9 @@ def _apply(
     now = datetime.now(timezone.utc)
     reg_date_field = window[0] if window else None
 
-    conn.execute(delete(staging))
+    conn.execute(delete(staging).where(true()))
     fetched = _load_staging(conn, staging, rows, key_fields, exclude_hash_fields, chunk_size, reg_date_field)
+    logger.info("%s: fetch done, %d rows staged, applying diff", table.name, fetched)
     stats = _diff_stats(conn, table, staging, detect_deletions, window)
     stats["fetched"] = fetched
 
@@ -125,7 +130,7 @@ def _apply(
     _close_stale(conn, table, staging, now, detect_deletions, window)
     _insert_new_versions(conn, table, staging, now)
 
-    conn.execute(delete(staging))
+    conn.execute(delete(staging).where(true()))
     return stats
 
 
@@ -274,7 +279,7 @@ def _insert_new_versions(conn: Connection, table: Table, staging: Table, now: da
         staging.c._natural_key,
         staging.c._row_hash,
         literal(now),
-        literal(None),
+        literal(None, type_=table.c._valid_to.type),
         literal(True),
         literal(now),
         staging.c._reg_date,

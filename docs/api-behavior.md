@@ -1,0 +1,78 @@
+# Comportamiento del API de la BDNS: ventanas de fecha
+
+[🇬🇧 English version](./api-behavior.en.md)
+
+Este documento recoge el comportamiento real del API de la BDNS respecto a los parámetros de fecha, verificado mediante pruebas en vivo contra el servicio. Se documenta en detalle porque estos comportamientos son sutiles, no figuran en la documentación oficial (o la contradicen), y un error en su manejo provoca pérdida silenciosa de datos.
+
+Cada afirmación indica la comprobación empírica que la respalda.
+
+## 1. Convención interna: rango de días inclusivo
+
+En `bdns-sync`, una ventana es un rango de días **inclusivo por ambos extremos**: la ventana `daily` sobre el día `X` significa "los registros del día `X`". El extremo superior de toda ventana es *ayer* (`date.today() - 1`), porque los datos del día en curso no están cerrados hasta la mañana siguiente.
+
+## 2. Semántica del extremo superior según el endpoint
+
+El API tiene dos familias de parámetros de fecha, y su extremo superior se comporta de forma **opuesta**:
+
+| Familia | Parámetros | Endpoints | Extremo superior | Comprobación en vivo (día `D`) |
+|---|---|---|---|---|
+| Búsqueda por fecha de registro | `fechaRegInicio` / `fechaRegFin` | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | **Exclusivo** (no incluye el día `D`) | `fechaRegFin=D` devuelve ~0 filas del día `D`; `fechaRegFin=D+1` devuelve el día `D` completo (en `concesiones`, 1 fila frente a 58.488) |
+| Descubrimiento de convocatorias | `fechaDesde` / `fechaHasta` | `convocatorias` (paso de descubrimiento) | **Inclusivo** (incluye el día `D`) | `fechaHasta=D` devuelve todas las convocatorias con `fechaRecepcion == D`; `fechaHasta=D+1` devuelve los días `D` y `D+1` |
+
+La conversión entre la convención interna (inclusiva) y la familia exclusiva está centralizada en una única función, `generic.to_api_upper_bound(fin_inclusivo)`, que suma un día al extremo superior. El endpoint `convocatorias` no la usa: su `fechaHasta` ya es inclusivo, y sumar un día incorporaría convocatorias de fuera de la ventana.
+
+En `convocatorias`, los parámetros de fecha solo intervienen en el paso de descubrimiento (`convocatorias_busqueda`): por cada código descubierto se solicita después el registro completo al endpoint de detalle (por `numConv`), que no tiene parámetros de fecha y es el que se almacena.
+
+El coste de `convocatorias` es por tanto lineal en el número de códigos, no en el ancho de la ventana. Medido en vivo con un mes real (mayo de 2026, 6.186 códigos): el descubrimiento tarda ~1 s, y el paso de detalle domina por completo. La latencia por llamada de detalle varía con la carga del servidor: ~0,22 s/llamada en horario favorable (un mes ≈ 23 minutos), pero una ejecución completa del mismo mes llegó a tardar 3 h 12 min (~1,9 s/llamada) con un único reintento por timeout. La ejecución terminó con éxito en ambos regímenes (6.186 filas, 0 descartes); solo cambia la duración.
+
+**Paso de detalle paralelizado.** Al ser una llamada por código sin paginación, el bucle secuencial original quedaba muy por debajo del límite de 10 peticiones/segundo (0,5-4,5 req/s reales según el régimen medido arriba). Se probó paralelizar con un pool de hilos: 10 hilos contra el limitador de tokens compartido del cliente provocó `HTTP 429 Too Many Requests` en segundos -- el bucket de tokens arranca lleno, así que el primer lote de un pool nuevo dispara sus peticiones simultáneas, y el servidor rechaza la ráfaga aunque el promedio declarado sea 10/s. Se confirmó en vivo que el servidor sí sostiene ~9,8 req/s sin ningún 429 cuando los *inicios* de petición se espacian 100 ms entre sí (round-robin entre 5-8 hilos, cada uno bloqueado por ese espaciado antes de disparar). La implementación final espacia arranques a 105 ms (margen bajo el límite) con 8 hilos; el mismo mes de mayo de 2026 tardó 10 min 54 s en paralelo frente a 23 min-3h12min en secuencial, sin ningún 429.
+
+Consecuencias de un manejo incorrecto, medidas en vivo:
+
+- Sin la conversión, la ventana `daily` de los cuatro endpoints `fechaReg` no devolvería prácticamente nada, y toda ventana más ancha perdería su día más reciente.
+- Con troceo (ver sección 3), el error se multiplica: se pierde un día por cada frontera de trozo. Un rango de 28 días troceado por día devolvió 8 filas en lugar de ~1,2 millones.
+
+## 3. Troceo de ventanas en piezas de 7 días
+
+Toda ventana se divide en piezas de como máximo 7 días antes de consultarse (`generic.iter_date_chunks`). Las ventanas `daily` y `weekly` caben en una sola pieza y no se ven afectadas; `monthly` y `annual` sí se trocean. Los motivos, ambos verificados contra `concesiones_busqueda`:
+
+- **Fiabilidad.** Un rango de 4 años (27,4 millones de filas) devuelve `ERR_MANTENIMIENTO_BBDD` de forma intermitente en cualquier profundidad de página. Una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos.
+- **Velocidad.** Un rango de 30 días consultado de una sola vez tardó 286,7 s; el mismo rango troceado en semanas tardó 142,5 s, ambos sin errores.
+
+### El resultado no depende del tamaño de trozo
+
+Como la conversión de fechas se aplica a cada pieza, el resultado es invariante al tamaño de trozo: un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días (comprobado en vivo).
+
+El tamaño de 7 días tampoco es crítico para la velocidad: sobre un rango fijo de 14 días de `concesiones_busqueda` (~530.000 filas), los tamaños de 1, 3, 7 y 14 días tardaron 51, 41, 47 y 57 s respectivamente, diferencias dentro del ruido de carga del servicio y sin errores en ningún caso. Se mantiene el tamaño de 7 días por equilibrio: rápido, fiable y coincidente con la ventana semanal.
+
+## 4. Verificación de los límites de ventana
+
+Para descartar tanto un solapamiento (traer un día de más) como un hueco (perder un día), se verificó en vivo, en las 5 entidades incrementales, que dos días consecutivos `X` y `X+1` consultados por la ruta real de producción, con la conversión correcta según familia, cumplen dos propiedades:
+
+1. `fetch(X)` y `fetch(X+1)` son **disjuntos** (solapamiento cero).
+2. Su unión es exactamente `fetch([X, X+1])` (**aditividad**).
+
+Las cuentas cuadran fila a fila: en `concesiones`, 115.862 + 68.457 = 184.319 filas, sin solapamiento. Un `+1` de más en la familia exclusiva, o un límite mal aplicado en la inclusiva, habría duplicado el día frontera; un día perdido habría roto la unión. El invariante está fijado como test permanente en `tests/test_generic.py`.
+
+## 5. Detección de bajas acotada por ventana
+
+Las entidades `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `convocatorias_busqueda` y `convocatorias` detectan bajas reales comparando, dentro de la misma ejecución, lo obtenido del API contra las filas de la tabla cuya propia fecha de registro (`fechaAlta`, `fechaRegistro` o `fechaRecepcion`, según la entidad) cae en el mismo rango.
+
+La comparación nunca se hace contra la ejecución anterior: produciría falsos positivos constantes, porque toda fila termina envejeciendo fuera de una ventana móvil sin que eso signifique una baja.
+
+`partidospoliticos_busqueda` queda excluida de la detección de bajas: se confirmó en vivo, con más de 70 filas reales en dos rangos de fechas distintos, que su payload no expone ningún campo de fecha de registro. El documento oficial afirma que este endpoint "funciona igual, con los mismos filtros y resultados" que `concesiones_busqueda`; en la práctica no es así. Es una limitación permanente salvo que el API cambie.
+
+## 6. Profundidad histórica por endpoint
+
+El alcance de una carga histórica completa lo determina la retención de datos del API por endpoint, medida en vivo:
+
+| Entidad | Datos disponibles hasta ~ | Limitado por |
+|---|---|---|
+| `concesiones_busqueda` | ~4 años | Retención de 4 años naturales |
+| `partidospoliticos_busqueda` | ~4 años | (sigue a concesiones) |
+| `ayudasestado_busqueda` | ~9-10 años | Retención de 10 años |
+| `minimis_busqueda` | ~10 años | Retención de 10 años |
+| `convocatorias_busqueda` | ~12 años | (sigue a `convocatorias`, misma fuente de descubrimiento) |
+| `convocatorias` | ~12 años | Arranque del portal (~2014) |
+
+Estas fechas no están codificadas en `bdns-sync`: la herramienta es un primitivo puro y no conoce la profundidad histórica de cada endpoint. Igual que `scripts/delta_load.sh` es dueño de la cadencia, `scripts/full_load.sh` es dueño de las fechas de inicio y las pasa mediante `--since`. Consultar fechas anteriores a la retención solo devuelve semanas vacías (una llamada barata cada una), por lo que las fechas del script son suelos conservadores, no primeros registros exactos.

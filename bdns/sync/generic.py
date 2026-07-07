@@ -16,12 +16,16 @@ still owns its own name, key fields, and any real one-off logic. Only the
 mechanical "fetch, then apply" plumbing lives here.
 """
 
+import logging
 from datetime import date, timedelta
 from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 from bdns.fetch import BDNSClient
 from bdns.sync.bookkeeping import run_with_bookkeeping
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # window name -> reg-date window size in days. Shared by every entity that
 # does cascading re-verification (concesiones, ayudasestado, minimis,
@@ -189,10 +193,43 @@ def sync_search_range(
 
     def rows():
         for chunk_start, chunk_end in iter_date_chunks(start, end):
+            logger.info("%s: chunk [%s .. %s]", endpoint_name, chunk_start, chunk_end)
             yield from fetch(
                 fechaRegInicio=chunk_start, fechaRegFin=to_api_upper_bound(chunk_end)
             )
 
+    return _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows)
+
+
+def sync_search_range_inclusive(
+    engine,
+    client: BDNSClient,
+    endpoint_name: str,
+    fetch_method_name: str,
+    key_fields: Sequence[str],
+    start: date,
+    end: date,
+    run_type: str,
+    reg_date_field: str = None,
+) -> Dict[str, int]:
+    """Same shape as `sync_search_range`, for the OTHER date-parameter family:
+    `fechaDesde`/`fechaHasta`, which is INCLUSIVE on the upper bound (unlike
+    `fechaRegFin`). Used by `convocatorias` and `convocatorias_busqueda`,
+    confirmed live -- `fechaHasta=D` already returns the full day `D`, so
+    `chunk_end` is passed as-is, with NO `to_api_upper_bound` bridge. Calling
+    that bridge here would over-fetch one extra day past the window.
+    """
+    fetch = getattr(client, fetch_method_name)
+
+    def rows():
+        for chunk_start, chunk_end in iter_date_chunks(start, end):
+            logger.info("%s: chunk [%s .. %s]", endpoint_name, chunk_start, chunk_end)
+            yield from fetch(fechaDesde=chunk_start, fechaHasta=chunk_end)
+
+    return _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows)
+
+
+def _sync_incremental_range(engine, endpoint_name, key_fields, start, end, run_type, reg_date_field, rows):
     return run_with_bookkeeping(
         engine,
         endpoint_name,

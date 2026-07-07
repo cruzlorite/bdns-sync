@@ -19,7 +19,7 @@ def test_full_syncers_cover_every_expected_table():
 
 
 def test_search_syncers_cover_every_expected_table():
-    assert len(SEARCH_SYNCERS) == 4
+    assert len(SEARCH_SYNCERS) == 5
     for name, fn in SEARCH_SYNCERS.items():
         assert isinstance(name, str) and name
         assert callable(fn)

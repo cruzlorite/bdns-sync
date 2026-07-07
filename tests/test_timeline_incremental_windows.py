@@ -44,6 +44,7 @@ INCREMENTAL_CASES = [
     ("ayudasestado_busqueda", ("idConcesion",)),
     ("minimis_busqueda", ("idConcesion",)),
     ("partidospoliticos_busqueda", ("id",)),
+    ("convocatorias_busqueda", ("numeroConvocatoria",)),
 ]
 
 CASE_IDS = [name for name, _ in INCREMENTAL_CASES]
@@ -54,6 +55,7 @@ SCOPED_DELETION_CASES = [
     ("concesiones_busqueda", ("id",)),
     ("ayudasestado_busqueda", ("idConcesion",)),
     ("minimis_busqueda", ("idConcesion",)),
+    ("convocatorias_busqueda", ("numeroConvocatoria",)),
 ]
 SCOPED_CASE_IDS = [name for name, _ in SCOPED_DELETION_CASES]
 
@@ -215,32 +217,37 @@ def test_window_date_bounds_match_the_declared_cadence(endpoint, key_fields, win
     behavior" check.
 
     The fetch is chunked into `CHUNK_DAYS`-wide pieces (see generic.py), so
-    for `monthly`/`annual` this is several calls, not one. Each call's `end`
-    in the log is the API's *exclusive* upper bound (inclusive chunk end + 1,
-    see `to_api_upper_bound`), so a chunk covering days [s, e] is recorded as
-    (s, e + 1). What matters: chunks are contiguous, none spans more than
-    `CHUNK_DAYS` days, and together they cover exactly the documented range,
-    with the final exclusive bound one day past yesterday.
+    for `monthly`/`annual` this is several calls, not one. For the four
+    `fechaRegFin` endpoints, each call's `end` in the log is the API's
+    *exclusive* upper bound (inclusive chunk end + 1, see
+    `to_api_upper_bound`), so a chunk covering days [s, e] is recorded as
+    (s, e + 1). `convocatorias_busqueda` is the opposite family
+    (`fechaHasta`, inclusive, see `sync_search_range_inclusive`): its `end`
+    is recorded as the inclusive chunk end itself, with no +1. What matters
+    either way: chunks are contiguous, none spans more than `CHUNK_DAYS`
+    days, and together they cover exactly the documented range.
     """
     engine = create_engine("sqlite:///:memory:")
     client = FakeBDNSClient()
     sync_fn = SEARCH_SYNCERS[endpoint]
     sync_fn(engine, client, window)
 
+    inclusive = endpoint == "convocatorias_busqueda"
     method = f"fetch_{endpoint}"
     calls = sorted(client.calls_to(method), key=lambda c: c["start"])
     expected_end = date.today() - timedelta(days=1)
     expected_start = expected_end - timedelta(days=days - 1)
 
     for call in calls:
-        # end is exclusive, so a full CHUNK_DAYS-wide chunk spans exactly CHUNK_DAYS
-        assert (call["end"] - call["start"]).days <= CHUNK_DAYS
+        span = (call["end"] - call["start"]).days
+        assert span <= (CHUNK_DAYS - 1 if inclusive else CHUNK_DAYS)
 
     assert calls[0]["start"] == expected_start
-    assert calls[-1]["end"] == expected_end + timedelta(days=1)  # exclusive upper bound
+    assert calls[-1]["end"] == (expected_end if inclusive else expected_end + timedelta(days=1))
     for prev, nxt in zip(calls, calls[1:]):
-        # next chunk's inclusive start meets the previous chunk's exclusive end
-        assert nxt["start"] == prev["end"]
+        # next chunk starts right after the previous chunk's own end
+        gap = timedelta(days=1) if inclusive else timedelta(days=0)
+        assert nxt["start"] == prev["end"] + gap
 
 
 @pytest.mark.parametrize("endpoint,key_fields", INCREMENTAL_CASES, ids=CASE_IDS)

@@ -2,14 +2,14 @@
 #
 # One-time historical backfill for the reg-date incremental endpoints.
 # bdns-sync itself is a pure primitive with no idea how far back each
-# endpoint's data goes, so -- like cron_dispatch.sh owns the cadence -- this
+# endpoint's data goes, so -- like delta_load.sh owns the cadence -- this
 # script owns the earliest dates. It calls `bdns-sync sync <entity> --since
 # <date>`, which syncs [since, yesterday] chunked into 7-day pieces (the same
 # machinery the daily/weekly/monthly/annual windows use).
 #
 #   BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/scripts/full_load.sh
 #
-# Run once to bootstrap a fresh target, then let cron_dispatch.sh keep it
+# Run once to bootstrap a fresh target, then let delta_load.sh keep it
 # current. It's safe to re-run: SCD2 is idempotent, an already-synced record
 # is just touched, not duplicated.
 #
@@ -30,4 +30,5 @@ backfill concesiones_busqueda        2020-01-01   # ~4y retention
 backfill partidospoliticos_busqueda  2020-01-01   # tracks concesiones
 backfill ayudasestado_busqueda       2015-01-01   # ~10y retention
 backfill minimis_busqueda            2015-01-01   # ~10y retention
+backfill convocatorias_busqueda       2013-01-01   # back to portal start
 backfill convocatorias               2013-01-01   # back to portal start

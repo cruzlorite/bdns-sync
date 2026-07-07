@@ -11,7 +11,7 @@
 # You should have received a copy of the GNU General Public License along
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""One named `sync_*` function per synced entity (per docs/sync-strategy.md).
+"""One named `sync_*` function per synced entity.
 Most are a one-liner delegating to the shared runners in `bdns.sync.generic`.
 convocatorias, grandesbeneficiarios, and planesestrategicos have real
 multi-step logic (discovery plus per-code detail calls), so they're longer,
@@ -19,17 +19,23 @@ but they're still just functions in this same file. None of them needs its
 own module.
 """
 
+import concurrent.futures
+import itertools
 import logging
+import threading
+import time
 from datetime import date
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-from bdns.fetch import BDNSClient
+from bdns.fetch import BDNSClient, TipoAdministracion
+from bdns.fetch.types import Ambito
 from bdns.sync.bookkeeping import run_with_bookkeeping
 from bdns.sync.generic import (
     iter_date_chunks,
     resolve_when,
     sync_full_catalog,
     sync_search_range,
+    sync_search_range_inclusive,
     sync_swept_catalog,
 )
 from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
@@ -37,8 +43,11 @@ from bdns.sync.scd2 import apply_full_reconciliation, apply_incremental
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-ADMIN_TYPES: Tuple[str, ...] = ("C", "A", "L", "O")
-REGLAMENTOS_AMBITOS: Tuple[str, ...] = ("C", "A", "M", "S", "P", "G")
+# Sourced from bdns-fetch's own enums rather than hand-copied, so a new
+# value added upstream (a new tipo de administración or ámbito) is picked
+# up automatically instead of silently missing from the sweep.
+ADMIN_TYPES: Tuple[str, ...] = tuple(TipoAdministracion)
+REGLAMENTOS_AMBITOS: Tuple[str, ...] = tuple(Ambito)
 
 
 def _skip_malformed(
@@ -68,40 +77,50 @@ def _skip_malformed(
 
 # --- full-replace-every-run entities (single call, natural key `id`) ------
 
+SECTORES_ENDPOINT = "sectores"
+ACTIVIDADES_ENDPOINT = "actividades"
+FINALIDADES_ENDPOINT = "finalidades"
+BENEFICIARIOS_ENDPOINT = "beneficiarios"
+INSTRUMENTOS_ENDPOINT = "instrumentos"
+OBJETIVOS_ENDPOINT = "objetivos"
+CONVOCATORIAS_ULTIMAS_ENDPOINT = "convocatorias_ultimas"
+REGIONES_ENDPOINT = "regiones"
+SANCIONES_BUSQUEDA_ENDPOINT = "sanciones_busqueda"
+
 
 def sync_sectores(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "sectores", "fetch_sectores", ("id",))
+    return sync_full_catalog(engine, client, SECTORES_ENDPOINT, "fetch_sectores", ("id",))
 
 
 def sync_actividades(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "actividades", "fetch_actividades", ("id",))
+    return sync_full_catalog(engine, client, ACTIVIDADES_ENDPOINT, "fetch_actividades", ("id",))
 
 
 def sync_finalidades(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "finalidades", "fetch_finalidades", ("id",))
+    return sync_full_catalog(engine, client, FINALIDADES_ENDPOINT, "fetch_finalidades", ("id",))
 
 
 def sync_beneficiarios(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "beneficiarios", "fetch_beneficiarios", ("id",))
+    return sync_full_catalog(engine, client, BENEFICIARIOS_ENDPOINT, "fetch_beneficiarios", ("id",))
 
 
 def sync_instrumentos(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "instrumentos", "fetch_instrumentos", ("id",))
+    return sync_full_catalog(engine, client, INSTRUMENTOS_ENDPOINT, "fetch_instrumentos", ("id",))
 
 
 def sync_objetivos(engine, client: BDNSClient) -> Dict[str, int]:
-    return sync_full_catalog(engine, client, "objetivos", "fetch_objetivos", ("id",))
+    return sync_full_catalog(engine, client, OBJETIVOS_ENDPOINT, "fetch_objetivos", ("id",))
 
 
 def sync_convocatorias_ultimas(engine, client: BDNSClient) -> Dict[str, int]:
     return sync_full_catalog(
-        engine, client, "convocatorias_ultimas", "fetch_convocatorias_ultimas", ("id",)
+        engine, client, CONVOCATORIAS_ULTIMAS_ENDPOINT, "fetch_convocatorias_ultimas", ("id",)
     )
 
 
 def sync_regiones(engine, client: BDNSClient) -> Dict[str, int]:
     # Tree-shaped, but still a single call. Unlike organos*, there's no idAdmon sweep here.
-    return sync_full_catalog(engine, client, "regiones", "fetch_regiones", ("id",))
+    return sync_full_catalog(engine, client, REGIONES_ENDPOINT, "fetch_regiones", ("id",))
 
 
 def sync_sanciones_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
@@ -109,7 +128,7 @@ def sync_sanciones_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
     return sync_full_catalog(
         engine,
         client,
-        "sanciones_busqueda",
+        SANCIONES_BUSQUEDA_ENDPOINT,
         "fetch_sanciones_busqueda",
         ("numeroConvocatoria", "sancionado", "fechaSancion"),
     )
@@ -117,10 +136,14 @@ def sync_sanciones_busqueda(engine, client: BDNSClient) -> Dict[str, int]:
 
 # --- swept entities (sweep a param, merge into one table before diffing) --
 
+ORGANOS_ENDPOINT = "organos"
+ORGANOS_AGRUPACION_ENDPOINT = "organos_agrupacion"
+REGLAMENTOS_ENDPOINT = "reglamentos"
+
 
 def sync_organos(engine, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
-        engine, client, "organos", "fetch_organos", "idAdmon", ADMIN_TYPES, ("idAdmon", "id")
+        engine, client, ORGANOS_ENDPOINT, "fetch_organos", "idAdmon", ADMIN_TYPES, ("idAdmon", "id")
     )
 
 
@@ -128,7 +151,7 @@ def sync_organos_agrupacion(engine, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
         engine,
         client,
-        "organos_agrupacion",
+        ORGANOS_AGRUPACION_ENDPOINT,
         "fetch_organos_agrupacion",
         "idAdmon",
         ADMIN_TYPES,
@@ -140,7 +163,7 @@ def sync_reglamentos(engine, client: BDNSClient) -> Dict[str, int]:
     return sync_swept_catalog(
         engine,
         client,
-        "reglamentos",
+        REGLAMENTOS_ENDPOINT,
         "fetch_reglamentos",
         "ambito",
         REGLAMENTOS_AMBITOS,
@@ -155,6 +178,11 @@ def sync_reglamentos(engine, client: BDNSClient) -> Dict[str, int]:
 # backfill). `resolve_when` collapses the two into one (start, end, run_type)
 # so the engine treats a one-day window and a ten-year backfill identically.
 
+CONCESIONES_BUSQUEDA_ENDPOINT = "concesiones_busqueda"
+AYUDASESTADO_BUSQUEDA_ENDPOINT = "ayudasestado_busqueda"
+MINIMIS_BUSQUEDA_ENDPOINT = "minimis_busqueda"
+PARTIDOSPOLITICOS_BUSQUEDA_ENDPOINT = "partidospoliticos_busqueda"
+
 
 def sync_concesiones_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
     # `fechaAlta` is the payload's own registration date, confirmed live
@@ -165,7 +193,7 @@ def sync_concesiones_busqueda(engine, client: BDNSClient, window=None, *, since=
     return sync_search_range(
         engine,
         client,
-        "concesiones_busqueda",
+        CONCESIONES_BUSQUEDA_ENDPOINT,
         "fetch_concesiones_busqueda",
         ("id",),
         start,
@@ -180,7 +208,7 @@ def sync_ayudasestado_busqueda(engine, client: BDNSClient, window=None, *, since
     return sync_search_range(
         engine,
         client,
-        "ayudasestado_busqueda",
+        AYUDASESTADO_BUSQUEDA_ENDPOINT,
         "fetch_ayudasestado_busqueda",
         ("idConcesion",),
         start,
@@ -195,7 +223,7 @@ def sync_minimis_busqueda(engine, client: BDNSClient, window=None, *, since=None
     return sync_search_range(
         engine,
         client,
-        "minimis_busqueda",
+        MINIMIS_BUSQUEDA_ENDPOINT,
         "fetch_minimis_busqueda",
         ("idConcesion",),
         start,
@@ -217,7 +245,7 @@ def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window=None, *, 
     return sync_search_range(
         engine,
         client,
-        "partidospoliticos_busqueda",
+        PARTIDOSPOLITICOS_BUSQUEDA_ENDPOINT,
         "fetch_partidospoliticos_busqueda",
         ("id",),
         start,
@@ -242,6 +270,48 @@ def sync_partidospoliticos_busqueda(engine, client: BDNSClient, window=None, *, 
 
 CONVOCATORIAS_ENDPOINT = "convocatorias"
 CONVOCATORIAS_KEY_FIELDS = ("codigoBDNS",)
+CONVOCATORIAS_BUSQUEDA_ENDPOINT = "convocatorias_busqueda"
+
+
+def sync_convocatorias_busqueda(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
+    """The discovery listing itself, stored like any other `_busqueda`
+    incremental entity. Same window/reg-date machinery as `sync_convocatorias`,
+    but this is a plain `sync_search_range` call, not the two-step flow:
+    the listing already carries everything it needs (`numeroConvocatoria`,
+    `fechaRecepcion`) in one page-paginated call, no per-code detail fetch.
+
+    This is a separate registered endpoint with its own run in `_sync_runs`,
+    not a byproduct of `sync_convocatorias`'s internal discovery step -- so
+    it can be synced (and fail, and be retried) independently of the
+    expensive detail phase, same as every other endpoint in this file.
+
+    Confirmed live: `numeroConvocatoria` here equals `codigoBDNS` on the
+    matching detail record (same value, both strings), so this table's
+    natural key lines up with `convocatorias`'s. The listing is NOT a
+    substitute for the detail table: it carries only 10 of the ~30 detail
+    fields (no budget, dates, documents, instruments, etc.), and its hash
+    changing (or not) says nothing about whether detail-only fields
+    changed -- never use it to skip a detail fetch.
+
+    Uses `sync_search_range_inclusive`, not `sync_search_range`: this
+    endpoint's date params are `fechaDesde`/`fechaHasta` (inclusive upper
+    bound), the same family `discover_convocatoria_codes` uses below --
+    NOT the `fechaRegInicio`/`fechaRegFin` (exclusive) family the four big
+    search endpoints use. Using the wrong helper here would silently drop
+    each chunk's last day, same bug class as the original daily-window fix.
+    """
+    start, end, run_type = resolve_when(window, since, until)
+    return sync_search_range_inclusive(
+        engine,
+        client,
+        CONVOCATORIAS_BUSQUEDA_ENDPOINT,
+        "fetch_convocatorias_busqueda",
+        ("numeroConvocatoria",),
+        start,
+        end,
+        run_type,
+        reg_date_field="fechaRecepcion",
+    )
 
 
 def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> Set[str]:
@@ -265,16 +335,71 @@ def discover_convocatoria_codes(client: BDNSClient, start: date, end: date) -> S
     return codes
 
 
+DETAIL_WORKERS = 8
+
+# Minimum gap between request *starts* across all detail workers. The
+# official limit is 10 req/s per IP, and the client's token bucket honors
+# that as an average -- but its bucket starts full, so a fresh worker pool
+# fires its first requests simultaneously, and the server 429s the burst
+# (confirmed live: 10 workers through the token bucket alone died on
+# HTTP 429 within seconds). The same server accepts a sustained 9.8 req/s
+# with zero 429s when starts are spaced (confirmed live at 100ms spacing);
+# 105ms keeps a small margin under the cap.
+DETAIL_SPACING_SECONDS = 0.105
+
+
 def fetch_convocatoria_details(
-    client: BDNSClient, codes: Set[str], errors: Optional[List[Dict[str, str]]] = None
+    client: BDNSClient,
+    codes: Set[str],
+    errors: Optional[List[Dict[str, str]]] = None,
+    max_workers: int = DETAIL_WORKERS,
 ) -> Iterator[dict]:
     """One real API call per code. This is the costly step in the two-step
     discover-then-detail flow.
+
+    Calls run through a thread pool: each `numConv` response is a single
+    record, so the client's page-level parallelism never engages, and a
+    sequential loop is latency-bound far below the 10 req/s budget
+    (measured live: 0.2-1.9 s/call depending on server load, i.e. 0.5-4.5
+    req/s). Request starts are paced `DETAIL_SPACING_SECONDS` apart, which
+    is what the server actually enforces (see comment above); with paced
+    starts the worker count only needs to cover latency (8 workers covers
+    ~0.8s of latency at full rate). Submission is windowed (2x workers) so
+    a backfill of tens of thousands of codes never buffers more than a
+    handful of fetched records ahead of the consumer.
+
+    `_skip_malformed` runs in the consumer thread, keeping `errors`
+    single-threaded. A hard fetch failure (after the client's own retries)
+    surfaces on `.result()` and fails the run, same as the sequential loop
+    did.
     """
-    for code in codes:
-        yield from _skip_malformed(
-            client.fetch_convocatorias(numConv=code), f"convocatorias numConv={code}", errors
-        )
+    pace_lock = threading.Lock()
+    next_start = [0.0]
+
+    def fetch_one(code):
+        with pace_lock:
+            now = time.monotonic()
+            wait = max(0.0, next_start[0] - now)
+            next_start[0] = now + wait + DETAIL_SPACING_SECONDS
+        if wait:
+            time.sleep(wait)
+        return code, list(client.fetch_convocatorias(numConv=code))
+
+    codes_iter = iter(codes)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        pending = {
+            executor.submit(fetch_one, code)
+            for code in itertools.islice(codes_iter, max_workers * 2)
+        }
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for code in itertools.islice(codes_iter, len(done)):
+                pending.add(executor.submit(fetch_one, code))
+            for future in done:
+                code, items = future.result()
+                yield from _skip_malformed(items, f"convocatorias numConv={code}", errors)
 
 
 def sync_convocatorias(engine, client: BDNSClient, window=None, *, since=None, until=None) -> Dict[str, int]:
@@ -436,18 +561,18 @@ def sync_planesestrategicos_vigencia(engine, client: BDNSClient) -> Dict[str, in
 
 # endpoint name -> sync(engine, client)
 FULL_SYNCERS = {
-    "sectores": sync_sectores,
-    "actividades": sync_actividades,
-    "finalidades": sync_finalidades,
-    "beneficiarios": sync_beneficiarios,
-    "instrumentos": sync_instrumentos,
-    "objetivos": sync_objetivos,
-    "convocatorias_ultimas": sync_convocatorias_ultimas,
-    "regiones": sync_regiones,
-    "sanciones_busqueda": sync_sanciones_busqueda,
-    "organos": sync_organos,
-    "organos_agrupacion": sync_organos_agrupacion,
-    "reglamentos": sync_reglamentos,
+    SECTORES_ENDPOINT: sync_sectores,
+    ACTIVIDADES_ENDPOINT: sync_actividades,
+    FINALIDADES_ENDPOINT: sync_finalidades,
+    BENEFICIARIOS_ENDPOINT: sync_beneficiarios,
+    INSTRUMENTOS_ENDPOINT: sync_instrumentos,
+    OBJETIVOS_ENDPOINT: sync_objetivos,
+    CONVOCATORIAS_ULTIMAS_ENDPOINT: sync_convocatorias_ultimas,
+    REGIONES_ENDPOINT: sync_regiones,
+    SANCIONES_BUSQUEDA_ENDPOINT: sync_sanciones_busqueda,
+    ORGANOS_ENDPOINT: sync_organos,
+    ORGANOS_AGRUPACION_ENDPOINT: sync_organos_agrupacion,
+    REGLAMENTOS_ENDPOINT: sync_reglamentos,
     GRANDESBENEFICIARIOS_ANIOS_ENDPOINT: sync_grandesbeneficiarios_anios,
     GRANDESBENEFICIARIOS_BUSQUEDA_ENDPOINT: sync_grandesbeneficiarios_busqueda,
     PLANESESTRATEGICOS_BUSQUEDA_ENDPOINT: sync_planesestrategicos_busqueda,
@@ -457,8 +582,9 @@ FULL_SYNCERS = {
 
 # endpoint name -> sync(engine, client, window)
 SEARCH_SYNCERS = {
-    "concesiones_busqueda": sync_concesiones_busqueda,
-    "ayudasestado_busqueda": sync_ayudasestado_busqueda,
-    "minimis_busqueda": sync_minimis_busqueda,
-    "partidospoliticos_busqueda": sync_partidospoliticos_busqueda,
+    CONCESIONES_BUSQUEDA_ENDPOINT: sync_concesiones_busqueda,
+    AYUDASESTADO_BUSQUEDA_ENDPOINT: sync_ayudasestado_busqueda,
+    MINIMIS_BUSQUEDA_ENDPOINT: sync_minimis_busqueda,
+    PARTIDOSPOLITICOS_BUSQUEDA_ENDPOINT: sync_partidospoliticos_busqueda,
+    CONVOCATORIAS_BUSQUEDA_ENDPOINT: sync_convocatorias_busqueda,
 }

@@ -13,10 +13,10 @@
 
 """Generic SCD2 table shape shared by every synced endpoint, plus control tables."""
 
-from typing import Tuple
+import json
+from typing import Any, Optional, Tuple
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     Column,
     Date,
@@ -25,7 +25,31 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    Text,
 )
+from sqlalchemy.types import TypeDecorator
+
+
+class PortableJSON(TypeDecorator):
+    """Stores JSON as text and (de)serializes in Python instead of relying
+    on a dialect's native JSON type. `sqlalchemy.JSON` hits real gaps on
+    BigQuery (no bind-parameter type for JSON, missing serializer wiring);
+    plain text is uniformly supported everywhere, and `payload` is never
+    queried in SQL by this codebase, only read back as a dict in Python.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[Any], dialect) -> Optional[str]:
+        if value is None:
+            return None
+        return json.dumps(value, default=str, ensure_ascii=False)
+
+    def process_result_value(self, value: Optional[str], dialect) -> Optional[Any]:
+        if value is None:
+            return None
+        return json.loads(value)
 
 
 def build_sync_table(name: str, metadata: MetaData) -> Table:
@@ -39,7 +63,9 @@ def build_sync_table(name: str, metadata: MetaData) -> Table:
     return Table(
         name,
         metadata,
-        Column("_id", Integer, primary_key=True, autoincrement=True),
+        # No surrogate key on purpose: identity is (_natural_key, _valid_from),
+        # nothing ever joins on a row id, and DB autoincrement isn't portable
+        # (BigQuery has none).
         Column("_natural_key", String, nullable=False, index=True),
         Column("_row_hash", String(64), nullable=False),
         Column("_valid_from", DateTime(timezone=True), nullable=False),
@@ -47,8 +73,14 @@ def build_sync_table(name: str, metadata: MetaData) -> Table:
         Column("_is_current", Boolean, nullable=False),
         Column("_synced_at", DateTime(timezone=True), nullable=False),
         Column("_reg_date", Date, nullable=True),
-        Column("payload", JSON, nullable=False),
+        Column("payload", PortableJSON, nullable=False),
         extend_existing=True,
+        # No-op outside BigQuery (dialect-namespaced kwarg, silently ignored
+        # elsewhere). Every SCD2 diff query equality-joins on `_natural_key`
+        # (scd2._matches) and most also filter `_is_current`; BigQuery has
+        # no secondary indexes (see dialects.py), clustering is its
+        # equivalent for pruning scans on these columns.
+        bigquery_clustering_fields=["_natural_key", "_is_current"],
     )
 
 
@@ -62,8 +94,9 @@ def build_staging_table(name: str, metadata: MetaData) -> Table:
         Column("_natural_key", String, nullable=False, index=True),
         Column("_row_hash", String(64), nullable=False),
         Column("_reg_date", Date, nullable=True),
-        Column("payload", JSON, nullable=False),
+        Column("payload", PortableJSON, nullable=False),
         extend_existing=True,
+        bigquery_clustering_fields=["_natural_key"],
     )
 
 
@@ -87,7 +120,9 @@ def build_control_tables(metadata: MetaData) -> Tuple[Table, Table, Table]:
     sync_runs = Table(
         "_sync_runs",
         metadata,
-        Column("run_id", Integer, primary_key=True, autoincrement=True),
+        # App-generated (epoch microseconds, see bookkeeping): DB autoincrement
+        # isn't portable (BigQuery has none) and this key is read back.
+        Column("run_id", Integer, primary_key=True, autoincrement=False),
         Column("table_name", String, nullable=False, index=True),
         Column("run_type", String, nullable=False),
         Column("started_at", DateTime(timezone=True), nullable=False),
@@ -103,7 +138,7 @@ def build_control_tables(metadata: MetaData) -> Tuple[Table, Table, Table]:
     sync_errors = Table(
         "_sync_errors",
         metadata,
-        Column("error_id", Integer, primary_key=True, autoincrement=True),
+        Column("error_id", Integer, primary_key=True, autoincrement=False),
         Column("run_id", Integer, nullable=False, index=True),
         Column("table_name", String, nullable=False, index=True),
         Column("context", String, nullable=False),

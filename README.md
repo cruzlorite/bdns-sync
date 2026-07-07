@@ -5,9 +5,33 @@
 
 [🇬🇧 English version](./README.en.md)
 
-Motor de sincronización que mantiene una copia versionada (SCD2) de la [API REST de la BDNS](https://www.infosubvenciones.es/bdnstrans/api).
+Motor de sincronización que mantiene una copia local versionada (SCD2) de la [API REST de la Base de Datos Nacional de Subvenciones (BDNS)](https://www.infosubvenciones.es/bdnstrans/api).
 
-[`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch) implementa una interfaz para extraer información, `bdns-sync` ofrece una capa de almacenamiento encima de `bdns-fetch`.
+Se apoya en [`bdns-fetch`](https://github.com/cruzlorite/bdns-fetch), que implementa la extracción de datos del API; `bdns-sync` añade la capa de almacenamiento: versionado histórico, detección de cambios y bajas, y registro de ejecuciones.
+
+Es una herramienta de propósito único: cada invocación sincroniza un endpoint, sin fichero de configuración. La cadencia de ejecución vive en [`scripts/delta_load.sh`](scripts/delta_load.sh).
+
+## Índice
+
+- [Requisitos](#requisitos)
+- [Instalación](#instalación)
+- [Uso](#uso)
+- [Bases de datos de destino](#bases-de-datos-de-destino)
+- [Operación programada](#operación-programada)
+- [Modelo de datos](#modelo-de-datos)
+- [Tipos de endpoint](#tipos-de-endpoint)
+- [Ventanas de fecha y carga histórica](#ventanas-de-fecha-y-carga-histórica)
+- [Buenas prácticas oficiales](#buenas-prácticas-oficiales)
+- [Limitaciones conocidas](#limitaciones-conocidas)
+- [Desarrollo](#desarrollo)
+- [Aviso legal](#aviso-legal)
+- [Licencia y enlaces](#licencia-y-enlaces)
+
+## Requisitos
+
+- Python 3.11 a 3.14
+- [Poetry](https://python-poetry.org/)
+- Una base de datos compatible con SQLAlchemy como destino (ver [Bases de datos de destino](#bases-de-datos-de-destino))
 
 ## Instalación
 
@@ -19,69 +43,102 @@ poetry install
 
 ## Uso
 
+El destino se configura con la variable de entorno `BDNS_SYNC_TARGET_URL` (una URL de SQLAlchemy):
+
 ```bash
 export BDNS_SYNC_TARGET_URL="bigquery://proyecto/dataset"   # o postgresql://..., sqlite:///...
+```
 
-bdns-sync list --kind full              # entidades de reemplazo completo
-bdns-sync list --kind search            # entidades incrementales
-bdns-sync sync sectores                 # sincroniza una entidad
-bdns-sync sync concesiones_busqueda --window daily          # ventana en cascada
-bdns-sync sync concesiones_busqueda --since 2020-01-01       # backfill histórico (hasta ayer)
+Comandos principales:
+
+```bash
+bdns-sync list --kind full                                    # lista las entidades de reemplazo completo
+bdns-sync list --kind search                                  # lista las entidades incrementales
+bdns-sync sync sectores                                       # sincroniza una entidad de catálogo
+bdns-sync sync concesiones_busqueda --window daily            # sincronización incremental por ventana
+bdns-sync sync concesiones_busqueda --since 2020-01-01        # carga histórica (hasta ayer)
 bdns-sync sync concesiones_busqueda --since 2020-01-01 --until 2020-12-31
 ```
 
-Vía cron, una línea (cadencia diaria/semanal/mensual/anual):
+## Bases de datos de destino
+
+Toda la lógica de sincronización usa SQL portable (subconsultas `EXISTS`/`NOT EXISTS` correlacionadas, sin `MERGE` ni `UPDATE ... FROM` específicos de un motor), por lo que cualquier base de datos con dialecto de SQLAlchemy sirve como destino. Verificado:
+
+| Destino | Estado | Notas |
+|---|---|---|
+| SQLite | Verificado (suite de tests completa) | Sin configuración adicional |
+| BigQuery | Verificado (en vivo, ciclo SCD2 completo) | Driver incluido como dependencia; ver más abajo |
+| PostgreSQL / MySQL | Compatible por diseño (SQL portable) | Requieren instalar su driver (`psycopg2`, `pymysql`, ...) |
+
+Las diferencias por motor se concentran en un único módulo de adaptadores, [`bdns/sync/dialects.py`](bdns/sync/dialects.py): el resto del código no distingue destinos. Para añadir soporte específico de otro motor basta con registrar un adaptador nuevo allí.
+
+### BigQuery
+
+```bash
+export BDNS_SYNC_TARGET_URL="bigquery://<proyecto>/<dataset>"
+```
+
+- **Autenticación**: credenciales por defecto de la aplicación (`gcloud auth application-default login`) o cuenta de servicio vía `GOOGLE_APPLICATION_CREDENTIALS`.
+- **Permisos mínimos**: `roles/bigquery.dataEditor` sobre el dataset y `roles/bigquery.jobUser` sobre el proyecto.
+- **Índices**: BigQuery no tiene índices secundarios; el adaptador los omite y en su lugar las tablas se crean con `CLUSTER BY (_natural_key, _is_current)`, las columnas por las que filtra toda la maquinaria SCD2.
+
+## Operación programada
+
+Para la operación continua basta una línea de cron. El script `delta_load.sh` decide internamente qué entidades y ventanas ejecutar cada día (cadencia diaria, semanal, mensual y anual):
 
 ```
-0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://proyecto/dataset /ruta/al/repo/scripts/cron_dispatch.sh
+0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://proyecto/dataset /ruta/al/repo/scripts/delta_load.sh
 ```
 
-Carga histórica inicial (una vez, antes de arrancar el cron):
+Antes de arrancar el cron, ejecute una única vez la carga histórica inicial:
 
 ```
 BDNS_SYNC_TARGET_URL=bigquery://proyecto/dataset /ruta/al/repo/scripts/full_load.sh
 ```
 
+La carga es idempotente: reejecutarla no duplica datos.
+
 ## Modelo de datos
 
-Cada endpoint sincronizado tiene su propia tabla, y todas comparten el mismo esquema genérico -- sin campos por endpoint. El registro original entra entero en `payload`; el resto son columnas de control SCD2:
+Cada endpoint sincronizado tiene su propia tabla, y todas comparten el mismo esquema genérico, sin campos específicos por endpoint. El registro original se almacena íntegro en `payload`; el resto son columnas de control SCD2:
 
-| Columna | Para qué |
+| Columna | Descripción |
 |---|---|
-| `_id` | PK autoincremental, solo interna |
-| `_natural_key` | Clave de negocio del registro (JSON de los campos clave; ver tabla de entidades más abajo) |
-| `_row_hash` | SHA-256 del payload canónico; así se detecta un cambio sin comparar campo a campo |
-| `_valid_from` / `_valid_to` | Vigencia de esta versión. `_valid_to` es `NULL` mientras es la versión actual |
+| `_natural_key` | Clave de negocio del registro (JSON de los campos clave; ver las tablas de entidades más abajo). Junto con `_valid_from` identifica cada versión |
+| `_row_hash` | SHA-256 del payload canónico; permite detectar cambios sin comparar campo a campo |
+| `_valid_from` / `_valid_to` | Periodo de vigencia de esta versión. `_valid_to` es `NULL` mientras es la versión actual |
 | `_is_current` | `True` en la versión vigente de cada clave natural |
-| `_synced_at` | Última vez que esta versión se vio en el origen (se actualiza aunque no cambie) |
-| `_reg_date` | Fecha de registro propia del payload. Solo se rellena en las entidades con detección de bajas por ventana (ver más abajo); en el resto queda `NULL` |
-| `payload` | JSON con el registro completo tal cual lo devuelve la API |
+| `_synced_at` | Última vez que esta versión se observó en el origen (se actualiza aunque no haya cambios) |
+| `_reg_date` | Fecha de registro propia del payload. Solo se rellena en las entidades con detección de bajas por ventana; `NULL` en el resto |
+| `payload` | El registro completo tal como lo devuelve el API, serializado como JSON (columna de texto, portable entre motores) |
 
-Si la API añade o quita un campo, no hace falta migración: se detecta por hash y se versiona como cualquier otro cambio.
+Si el API añade o elimina un campo no se requiere migración: el cambio se detecta por hash y se versiona como cualquier otro.
 
-**Tablas de control** (compartidas por todos los endpoints, prefijo `_sync_`):
+### Tablas de control
 
-- **`_sync_state`** -- una fila por tabla, la marca de agua: `table_name`, `last_synced_at`, `last_run_id`.
-- **`_sync_runs`** -- registro append-only de cada ejecución: `run_id`, `table_name`, `run_type` (`full` o `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, y los contadores `rows_fetched`, `rows_inserted`, `rows_soft_deleted`, `rows_skipped`.
-- **`_sync_errors`** -- una fila por registro malformado descartado: `error_id`, `run_id`, `table_name`, `context`, `content` (truncado a 200 caracteres), `occurred_at`. Ver [Limitaciones conocidas](#limitaciones-conocidas).
+Compartidas por todos los endpoints, con prefijo `_sync_`:
+
+- **`_sync_state`**: una fila por tabla, con la marca de agua: `table_name`, `last_synced_at`, `last_run_id`.
+- **`_sync_runs`**: registro *append-only* de cada ejecución: `run_id`, `table_name`, `run_type` (`full` o `daily`/`weekly`/`monthly`/`annual`), `started_at`/`finished_at`, `status` (`running`/`success`/`failed`), `error`, y los contadores `rows_fetched`, `rows_inserted`, `rows_soft_deleted` y `rows_skipped`.
+- **`_sync_errors`**: una fila por registro malformado descartado: `error_id`, `run_id`, `table_name`, `context`, `content` (truncado a 200 caracteres), `occurred_at`. Ver [Limitaciones conocidas](#limitaciones-conocidas).
 
 ## Tipos de endpoint
 
-Dos familias, según volumen.
+Hay dos familias, determinadas por el volumen de datos.
 
 ### Reemplazo completo (`bdns-sync sync <entidad>`)
 
-Catálogos pequeños -- traer todo cada vez sale barato.
+Catálogos pequeños, donde traer el conjunto completo en cada ejecución es asumible.
 
-| Forma | Por qué | Entidades |
+| Forma | Motivo | Entidades |
 |---|---|---|
-| Simple | Una llamada, sin parámetros | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones` |
-| Barrido | La API no da la unión si omites el parámetro -- hay que pedir cada valor y fusionar en una tabla | `organos`/`organos_agrupacion` (barren `idAdmon`), `reglamentos` (barre `ambito`), `sanciones_busqueda` |
-| Descubre y detalla | El listado no trae todos los campos | `planesestrategicos_busqueda`/`planesestrategicos`/`planesestrategicos_vigencia`, `grandesbeneficiarios_anios`/`grandesbeneficiarios_busqueda` |
+| Simple | Una sola llamada, sin parámetros | `sectores`, `actividades`, `finalidades`, `beneficiarios`, `instrumentos`, `objetivos`, `convocatorias_ultimas`, `regiones` |
+| Barrido | El API no devuelve la unión si se omite el parámetro; hay que consultar cada valor y fusionar los resultados en una tabla | `organos`/`organos_agrupacion` (barren `idAdmon`), `reglamentos` (barre `ambito`), `sanciones_busqueda` |
+| Descubrimiento y detalle | El listado no incluye todos los campos | `planesestrategicos_busqueda`/`planesestrategicos`/`planesestrategicos_vigencia`, `grandesbeneficiarios_anios`/`grandesbeneficiarios_busqueda` |
 
 ### Incremental por fecha de registro (`bdns-sync sync <entidad> --window {daily,weekly,monthly,annual}`)
 
-Decenas de millones de filas -- traerlos enteros cada vez es inviable.
+Endpoints con decenas de millones de filas, donde el reemplazo completo no es viable.
 
 | Entidad | Clave natural |
 |---|---|
@@ -89,66 +146,45 @@ Decenas de millones de filas -- traerlos enteros cada vez es inviable.
 | `ayudasestado_busqueda` | `idConcesion` |
 | `minimis_busqueda` | `idConcesion` |
 | `partidospoliticos_busqueda` | `id` |
+| `convocatorias_busqueda` | `numeroConvocatoria` |
 | `convocatorias` | `codigoBDNS` |
 
-La fecha de registro no cambia al editar un registro, así que reconsultar la misma ventana más tarde no encuentra altas nuevas, pero sí detecta ediciones por hash. Las correcciones se concentran cerca del registro y bajan con la antigüedad, de ahí la cascada: `daily` siempre corre, `weekly`/`monthly`/`annual` son verificaciones *extra* el mismo día, no sustituyen a la diaria.
+`convocatorias` es un caso de dos pasos: el descubrimiento consulta el listado de `convocatorias_busqueda` por rango de fechas para obtener los códigos registrados en la ventana, y cada código descubierto se solicita después completo al endpoint de detalle (`convocatorias`, por `numConv`). El registro de detalle es el que se versiona en la tabla `convocatorias`; el listado de descubrimiento se sincroniza además como su propia tabla, `convocatorias_busqueda`, con la misma máquina incremental que el resto de entidades de esta sección.
 
-#### Cómo se consultan las ventanas de fecha (comportamiento real del API)
+`convocatorias_busqueda` **no sustituye** a `convocatorias`: el listado trae solo 10 de los ~30 campos del detalle (sin presupuesto, fechas de solicitud, documentos, instrumentos, etc.), y que su hash no cambie no dice nada sobre si cambió un campo exclusivo del detalle. Nunca se debe usar el listado para decidir si conviene omitir la llamada de detalle de un código.
 
-Esta parte concentra varios hallazgos comprobados en vivo contra el API. Se documentan en detalle porque son sutiles, no están en la documentación oficial (o la contradicen), y equivocarse aquí provoca pérdida silenciosa de datos.
+El paso de detalle de `convocatorias` es el caro: una llamada real por código descubierto, sin paginación posible (una sola llamada trae un único registro). Medido en vivo con un mes real (mayo de 2026, 6.186 códigos), en secuencial esto tardó entre 23 minutos y 3 h 12 min según la carga del servidor. El paso de detalle está paralelizado (8 hilos, ritmo de arranque de ~9,5 peticiones/segundo, justo bajo el límite de 10/s) para acercarse al límite oficial en vez de quedar atado a la latencia de una sola conexión; el mismo mes tardó 10 min 54 s en paralelo, sin ningún `429`.
 
-**1. La ventana es un rango de días inclusivo por ambos extremos.** `daily` sobre el día `X` significa "los registros de `X`". El extremo superior de toda ventana es *ayer* (`date.today() - 1`), porque los datos de "hoy" no están cerrados hasta la mañana siguiente.
+La fecha de registro de un registro no cambia cuando este se edita, por lo que reconsultar la misma ventana más adelante no encuentra altas nuevas, pero sí detecta ediciones mediante el hash. Las correcciones se concentran cerca de la fecha de registro y disminuyen con la antigüedad; de ahí la cascada de ventanas: `daily` se ejecuta siempre, y `weekly`/`monthly`/`annual` son verificaciones adicionales del mismo día, no sustitutos de la diaria.
 
-**2. El extremo superior del API tiene semántica OPUESTA según el endpoint.** Hay dos familias de parámetros de fecha, y se comportan al revés:
+## Ventanas de fecha y carga histórica
 
-| Familia | Parámetros | Endpoints | Extremo superior | Comprobación en vivo (día `D`) |
-|---|---|---|---|---|
-| Búsqueda por fecha de registro | `fechaRegInicio` / `fechaRegFin` | `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda`, `partidospoliticos_busqueda` | **exclusivo** (no incluye el día `D`) | `fechaRegFin=D` → ~0 filas de `D`; `fechaRegFin=D+1` → día `D` completo (en `concesiones`, 1 vs 58.488) |
-| Descubrimiento de convocatorias | `fechaDesde` / `fechaHasta` | `convocatorias` (paso de descubrimiento) | **inclusivo** (sí incluye el día `D`) | `fechaHasta=D` → todas las convocatorias con `fechaRecepcion == D`; `fechaHasta=D+1` → días `D` y `D+1` |
+El manejo de fechas contra el API tiene varias sutilezas verificadas en vivo, documentadas en detalle en [docs/api-behavior.md](docs/api-behavior.md). Resumen:
 
-El puente entre nuestra convención (inclusiva) y la familia exclusiva está en un único sitio con nombre propio, `generic.to_api_upper_bound(fin_inclusivo)`, que suma un día. Convocatorias **no** lo usa: su `fechaHasta` ya es inclusivo, sumar un día traería convocatorias de fuera de la ventana. Si esto no se hubiera detectado: `daily` de los cuatro endpoints `fechaReg` no traería casi nada, y toda ventana más ancha perdería su día más reciente (y, una vez troceada, un día por cada frontera de trozo -- un rango de 28 días troceado por día devolvía 8 filas en vez de ~1,2M).
+- Una ventana es un rango de días inclusivo por ambos extremos; el extremo superior siempre es ayer.
+- El API tiene dos familias de parámetros de fecha con semántica de extremo superior **opuesta** (exclusiva en `fechaRegFin`, inclusiva en `fechaHasta`). La conversión está centralizada en `generic.to_api_upper_bound`.
+- Toda ventana se trocea en piezas de máximo 7 días antes de consultarse, por fiabilidad y velocidad. El resultado no depende del tamaño de trozo.
+- La corrección de los límites (sin solapamientos ni huecos entre días consecutivos) está verificada en vivo en las 5 entidades y fijada como test permanente.
+- Cuatro de las cinco entidades incrementales detectan además bajas reales, comparando lo obtenido contra las filas de la tabla cuya fecha de registro cae en el mismo rango.
 
-**3. Cada ventana se trocea en piezas de máximo 7 días antes de pedirla** (`generic.iter_date_chunks`). `daily`/`weekly` ya caben en una pieza, no cambian; `monthly`/`annual` sí se trocean. Motivos, ambos comprobados en vivo contra `concesiones_busqueda`:
+Las ventanas en cascada llegan como máximo a 365 días atrás. Para la carga histórica completa se usa `--since DATE [--until DATE]`, que emplea exactamente la misma maquinaria. La profundidad histórica disponible depende de la retención del API por endpoint, desde ~4 años (`concesiones_busqueda`) hasta ~12 (`convocatorias`); [`scripts/full_load.sh`](scripts/full_load.sh) ya incluye fechas de inicio conservadoras por entidad. Ver la tabla completa en [docs/api-behavior.md](docs/api-behavior.md#6-profundidad-histórica-por-endpoint).
 
-- **Fiabilidad**: un rango de 4 años (27,4M filas) devuelve `ERR_MANTENIMIENTO_BBDD` de forma intermitente en cualquier profundidad de página; una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos.
-- **Velocidad**: un rango de 30 días de una sola vez tardó 286,7s; el mismo rango troceado en semanas tardó 142,5s, ambos sin errores.
+## Buenas prácticas oficiales
 
-Como el puente de fecha se aplica por pieza, **el resultado no depende del tamaño de trozo**: un rango de 14 días de `partidospoliticos_busqueda` devuelve exactamente las mismas 36 filas troceado en piezas de 1, 7 o 14 días (comprobado en vivo). El tamaño de 7 días tampoco es crítico para la velocidad: midiendo un rango fijo de 14 días de `concesiones` (~530k filas), 1/3/7/14 días tardaron 51/41/47/57s -- diferencias dentro del ruido de carga en vivo, sin errores en ninguno. 7 días queda como equilibrio: rápido, fiable, y coincide con la ventana semanal.
+El diseño sigue el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf):
 
-**4. Verificación "belt-and-suspenders" de los límites.** Para descartar tanto un solapamiento (traer un día de más) como un hueco (perder un día), se comprobó en vivo, en las 5 entidades, que dos días consecutivos `X` y `X+1` -- pedidos por la ruta real de producción con el puente correcto según familia -- cumplen: `fetch(X)` y `fetch(X+1)` son disjuntos (solape 0), y su unión es exactamente `fetch([X, X+1])`. La cuenta cuadra al registro: en `concesiones`, 115.862 + 68.457 = 184.319 filas, sin solape. Un `+1` de más (en la familia exclusiva) o un límite mal puesto (en la inclusiva) habría duplicado el día frontera; un día perdido habría roto la unión. El invariante queda fijado como test permanente (`test_generic.py`).
-
-**Detección de bajas por ventana**: `concesiones_busqueda`, `ayudasestado_busqueda`, `minimis_busqueda` y `convocatorias` también detectan bajas reales, comparando, dentro de la misma ejecución, lo traído contra las filas de la tabla cuya propia fecha de registro (`fechaAlta`/`fechaRegistro`/`fechaRecepcion`, según la entidad) cae en ese mismo rango. No se compara contra la ejecución anterior, porque eso daría falsos positivos constantes: toda fila envejece fuera de una ventana móvil tarde o temprano, sin que eso signifique baja. `partidospoliticos_busqueda` queda fuera: confirmado en vivo que su payload no expone ningún campo de fecha de registro, pese a que el documento oficial afirma que "funciona igual, con los mismos filtros y resultados" que `concesiones_busqueda`. No es así. Es una limitación real y permanente, salvo que la API cambie.
-
-#### Carga histórica
-
-Las ventanas en cascada solo llegan hasta 365 días atrás (`annual`). Para una carga histórica completa se usa `--since DATE [--until DATE]`, que sincroniza un rango de fechas explícito con exactamente la misma maquinaria (troceo de 7 días, puente de fecha por familia, detección de bajas acotada al rango). El tamaño de una carga completa lo marca lo que el API retiene por endpoint -- medido en vivo:
-
-| Entidad | Datos hasta ~ | Limitado por |
-|---|---|---|
-| `concesiones_busqueda` | ~4 años | retención de 4 años naturales |
-| `partidospoliticos_busqueda` | ~4 años | (sigue a concesiones) |
-| `ayudasestado_busqueda` | ~9-10 años | retención de 10 años |
-| `minimis_busqueda` | ~10 años | retención de 10 años |
-| `convocatorias` | ~12 años | arranque del portal (~2014) |
-
-Estas fechas **no** están en el código: `bdns-sync` es un primitivo puro, no sabe cuánta historia tiene cada endpoint. Igual que `cron_dispatch.sh` es dueño de la cadencia, [`scripts/full_load.sh`](scripts/full_load.sh) es dueño de las fechas de inicio y las pasa con `--since`. Pedir fechas anteriores a la retención solo devuelve semanas vacías (una llamada barata cada una), así que las fechas del script son suelos conservadores, no primeros exactos. La carga es idempotente: reejecutarla no duplica nada (SCD2 solo hace *touch* de lo ya sincronizado).
-
-## Buenas prácticas (oficiales)
-
-Según el documento oficial ["Buenas prácticas API SNPSAP"](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf):
-
-- **Límite de 10 peticiones/segundo por IP**, aplicado por `bdns-fetch`.
-- **Paginación al máximo** (10.000 registros/llamada).
-- **Cadencia diaria/semanal/mensual/anual por fecha de registro**: recomendación oficial, no diseño propio.
-- **`terceros` no se usa**: el propio documento lo señala como redundante.
-- **Reconciliación completa para detectar bajas**: las ayudas se retiran de la BDNS a los 4 años naturales siguientes a la concesión; los catálogos completos lo detectan por comparación contra todo el estado actual. Para los grandes endpoints incrementales, donde reconciliar contra 20M+ filas cada vez es inviable, se usa en su lugar una comparación acotada a la fecha de registro propia de cada fila (ver más arriba).
+- **Límite de 10 peticiones por segundo y por IP**, aplicado por `bdns-fetch`.
+- **Paginación al tamaño máximo** (10.000 registros por llamada).
+- **Cadencia diaria/semanal/mensual/anual por fecha de registro**, tal como recomienda el documento.
+- **El endpoint `terceros` no se usa**: el propio documento lo señala como redundante.
+- **Reconciliación para detectar bajas**: las ayudas se retiran de la BDNS a los 4 años naturales siguientes a la concesión. Los catálogos completos detectan las bajas comparando contra todo el estado actual; en los grandes endpoints incrementales, donde esa comparación no es viable, se usa una comparación acotada por fecha de registro (ver [docs/api-behavior.md](docs/api-behavior.md#5-detección-de-bajas-acotada-por-ventana)).
 
 ## Limitaciones conocidas
 
-- `organos_codigo` / `organos_codigoadmin` sin implementar (grupo H).
-- `partidospoliticos_busqueda` sin detección de bajas: a diferencia de las otras 4 entidades incrementales, su payload no expone ningún campo de fecha de registro.
-- Registros individuales malformados se descartan con log (nivel WARNING), se cuentan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto + contenido truncado a 200 caracteres, enlazado por `run_id`). Nunca se guardan en las tablas sincronizadas: no tienen clave natural real, así que no se pueden versionar como una fila normal.
-- Un rango de varios años pedido en **una sola llamada** falla de forma intermitente: probado en vivo (4 años, `concesiones_busqueda`, 27,4M filas), la API devuelve `ERR_MANTENIMIENTO_BBDD` en cualquier profundidad de página, mientras que una ventana semanal sobre las mismas fechas no falló ni una vez en 6 intentos. Por eso todo se trocea a 7 días; la carga histórica (`--since`, ver [Carga histórica](#carga-histórica)) hereda ese troceo, así que no hay que pedir rangos anchos a mano.
+- `organos_codigo` y `organos_codigoadmin` no están implementados (grupo H).
+- `partidospoliticos_busqueda` no tiene detección de bajas: a diferencia de las otras cuatro entidades incrementales, su payload no expone ningún campo de fecha de registro (verificado en vivo; ver [docs/api-behavior.md](docs/api-behavior.md#5-detección-de-bajas-acotada-por-ventana)).
+- Los registros individuales malformados se descartan con un aviso en el log (nivel WARNING), se contabilizan en `_sync_runs.rows_skipped` y quedan registrados en `_sync_errors` (contexto y contenido truncado a 200 caracteres, enlazados por `run_id`). Nunca se almacenan en las tablas sincronizadas: sin clave natural válida no pueden versionarse como una fila normal.
+- Los rangos de fechas de varios años solicitados en una sola llamada fallan de forma intermitente en el API (`ERR_MANTENIMIENTO_BBDD`). Por ello toda consulta se trocea en piezas de 7 días, incluida la carga histórica con `--since`; no es necesario trocear manualmente.
 
 ## Desarrollo
 
@@ -160,12 +196,12 @@ make test
 
 ## Aviso legal
 
-Proyecto no oficial, sin afiliación con la Base de Datos Nacional de Subvenciones (BDNS) ni con el Ministerio de Hacienda. Se distribuye bajo licencia GPL v3, que excluye expresamente cualquier garantía: se usa bajo tu propia responsabilidad, sin garantía de ningún tipo y sin que el autor asuma responsabilidad alguna por daños, pérdidas de datos o usos indebidos.
+Proyecto no oficial, sin afiliación con la Base de Datos Nacional de Subvenciones (BDNS) ni con el Ministerio de Hacienda. Se distribuye bajo licencia GPL v3, que excluye expresamente cualquier garantía: el uso es bajo responsabilidad del usuario, sin garantía de ningún tipo y sin que el autor asuma responsabilidad alguna por daños, pérdidas de datos o usos indebidos.
 
-Los datos sincronizados proceden del [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) y están sujetos a su propio [aviso legal](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) y a las [buenas prácticas de la API](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf).
+Los datos sincronizados proceden del [Sistema Nacional de Publicidad de Subvenciones y Ayudas Públicas](https://www.infosubvenciones.es) y están sujetos a su propio [aviso legal](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal) y a las [buenas prácticas del API](https://www.infosubvenciones.es/bdnstrans/estaticos/ayuda/Buenas%20pr%C3%A1cticas%20API%20SNPSAP.pdf).
 
 ## Licencia y enlaces
 
 - [GNU GPL v3.0](./LICENSE)
 - [API oficial](https://www.infosubvenciones.es/bdnstrans/api) · [Portal BDNS](https://www.infosubvenciones.es) · [Aviso legal BDNS](https://www.infosubvenciones.es/bdnstrans/GE/es/avisolegal)
-- [bdns-fetch](https://github.com/cruzlorite/bdns-fetch)
+- Proyecto hermano: [bdns-fetch](https://github.com/cruzlorite/bdns-fetch) (extracción)

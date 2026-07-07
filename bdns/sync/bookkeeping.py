@@ -16,13 +16,19 @@ tables, log the run in `_sync_runs`, apply the group's own fetch+SCD2 logic,
 record the outcome, and bump the `_sync_state` watermark.
 """
 
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Callable, Dict
 
 from sqlalchemy import MetaData, insert, update
 from sqlalchemy.engine import Engine
 
+from bdns.sync.dialects import get_adapter
 from bdns.sync.schema import build_control_tables, build_staging_table, build_sync_table
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def run_with_bookkeeping(
@@ -36,13 +42,21 @@ def run_with_bookkeeping(
     table = build_sync_table(endpoint_name, metadata)
     staging = build_staging_table(endpoint_name, metadata)
     sync_state, sync_runs, sync_errors = build_control_tables(metadata)
+    get_adapter(engine).prepare_metadata(metadata)
     metadata.create_all(engine, checkfirst=True)
 
     started_at = datetime.now(timezone.utc)
+    # App-generated id (epoch microseconds) instead of DB autoincrement:
+    # BigQuery has none, and this key is read back (it links `_sync_errors`
+    # and the final status update). One id per run and runs are sequential
+    # per orchestrator, so microseconds can't collide.
+    run_id = time.time_ns() // 1_000
+    logger.info("%s: run %s (%s) starting", endpoint_name, run_id, run_type)
 
     with engine.begin() as conn:
-        run_id = conn.execute(
+        conn.execute(
             insert(sync_runs).values(
+                run_id=run_id,
                 table_name=endpoint_name,
                 run_type=run_type,
                 started_at=started_at,
@@ -51,11 +65,13 @@ def run_with_bookkeeping(
                 rows_inserted=0,
                 rows_soft_deleted=0,
             )
-        ).inserted_primary_key[0]
+        )
 
         try:
             stats = apply_fn(conn, table, staging)
         except Exception as exc:
+            logger.error("%s: run %s failed after %.1fs: %s", endpoint_name, run_id,
+                         (datetime.now(timezone.utc) - started_at).total_seconds(), exc)
             conn.execute(
                 update(sync_runs)
                 .where(sync_runs.c.run_id == run_id)
@@ -86,17 +102,24 @@ def run_with_bookkeeping(
                 insert(sync_errors),
                 [
                     {
+                        "error_id": run_id + i,
                         "run_id": run_id,
                         "table_name": endpoint_name,
                         "context": detail["context"],
                         "content": detail["content"],
                         "occurred_at": finished_at,
                     }
-                    for detail in skip_details
+                    for i, detail in enumerate(skip_details)
                 ],
             )
         _upsert_sync_state(conn, sync_state, endpoint_name, finished_at, run_id)
 
+    logger.info(
+        "%s: run %s done in %.1fs (fetched=%d inserted=%d updated=%d touched=%d soft_deleted=%d skipped=%d)",
+        endpoint_name, run_id, (finished_at - started_at).total_seconds(),
+        stats["fetched"], stats["inserted"], stats["updated"], stats["touched"],
+        stats.get("soft_deleted", 0), stats.get("skipped", 0),
+    )
     return stats
 
 
