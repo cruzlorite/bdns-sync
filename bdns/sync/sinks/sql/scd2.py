@@ -29,6 +29,8 @@ code path run unchanged on SQLite, Postgres, MySQL, and BigQuery.
 """
 
 import logging
+import queue
+import threading
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence
 
@@ -144,30 +146,98 @@ def _load_staging(
     chunk_size: int,
     reg_date_field: Optional[str] = None,
 ) -> int:
+    """Producer/consumer split so the API fetch of the next chunk overlaps
+    with the database write of the current one, instead of the fetch
+    sitting idle for the duration of every write (which is seconds per
+    batch on BigQuery).
+
+    The PRODUCER thread consumes `rows` (the API fetch generator, which has
+    no thread affinity) and turns each record into a staged dict; full
+    chunks go on a small bounded queue. The CONSUMER is this function, on
+    the caller's own thread: it drains the queue and writes each chunk via
+    `adapter.insert_rows`. Threading it this way round -- fetch on the
+    helper thread, writes on the caller's thread -- is what keeps `conn`
+    on the single thread that created it, which SQLite hard-requires
+    (its DBAPI objects are thread-affine: using one from another thread
+    raises, confirmed live). The write-on-helper-thread arrangement would
+    need a per-dialect capability flag just to exist; this one is safe for
+    every dialect unconditionally.
+
+    Writes stay strictly one-at-a-time (each `insert_rows` finishes before
+    the next chunk is taken). That pace matters on BigQuery: it caps table
+    update operations (load jobs included) at a low fixed rate regardless
+    of whether earlier ones finished, so concurrent writes trip `429 too
+    many table update operations for this table` -- a hard platform limit
+    (measured live), not a raisable quota. Serial writes paced by each
+    job's own duration stay comfortably under it.
+
+    The bounded queue is the backpressure: if writes fall behind, the
+    producer blocks on `put` instead of buffering the whole backfill in
+    memory.
+    """
     adapter = get_adapter(conn.engine)
-    fetched = 0
-    chunk = []
-    for payload in rows:
-        staged = {
-            "_natural_key": natural_key(payload, key_fields),
-            "_row_hash": row_hash(payload, exclude_hash_fields),
-            "payload": payload,
-        }
-        if reg_date_field:
-            staged["_reg_date"] = datetime.strptime(payload[reg_date_field], "%Y-%m-%d").date()
-        chunk.append(staged)
-        if len(chunk) >= chunk_size:
-            adapter.insert_rows(conn, staging, chunk)
-            fetched += len(chunk)
+    chunk_queue: "queue.Queue" = queue.Queue(maxsize=2)
+    _DONE = object()
+    consumer_failed = threading.Event()
+
+    def produce():
+        try:
             chunk = []
+            for payload in rows:
+                staged = {
+                    "_natural_key": natural_key(payload, key_fields),
+                    "_row_hash": row_hash(payload, exclude_hash_fields),
+                    "payload": payload,
+                }
+                if reg_date_field:
+                    staged["_reg_date"] = datetime.strptime(payload[reg_date_field], "%Y-%m-%d").date()
+                chunk.append(staged)
+                if len(chunk) >= chunk_size:
+                    if not put(chunk):
+                        return  # consumer died; its exception is the real error
+                    chunk = []
+            if chunk:
+                put(chunk)
+            put(_DONE)
+        except Exception as exc:  # fetch failure: hand it to the consumer to re-raise
+            put(exc)
+
+    def put(item) -> bool:
+        """Blocks until queued, re-checking every second whether the
+        consumer died -- otherwise a full queue would hang the producer
+        forever instead of letting the consumer's error surface.
+        """
+        while not consumer_failed.is_set():
+            try:
+                chunk_queue.put(item, timeout=1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+
+    fetched = 0
+    try:
+        while True:
+            item = chunk_queue.get()
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            adapter.insert_rows(conn, staging, item)
+            fetched += len(item)
             # every ~50k rows: staging a multi-million-row backfill takes
             # hours, so it can't be a silent gap between the per-chunk fetch
             # logs and the final "fetch done" line.
             if fetched % (chunk_size * 10) == 0:
                 logger.info("%s: %d rows staged so far", staging.name, fetched)
-    if chunk:
-        adapter.insert_rows(conn, staging, chunk)
-        fetched += len(chunk)
+    except BaseException:
+        consumer_failed.set()  # unblock the producer so it can exit
+        raise
+    finally:
+        producer.join()
     return fetched
 
 

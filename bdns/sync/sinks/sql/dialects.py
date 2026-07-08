@@ -64,15 +64,50 @@ class BigQueryAdapter(DialectAdapter):
             table.indexes.clear()
 
     def insert_rows(self, conn: Connection, table: Table, rows: Sequence[Dict[str, Any]]) -> None:
-        """One multi-row VALUES statement per sub-batch instead of the default
-        executemany: the BigQuery DBAPI runs executemany as one DML job PER
-        ROW, each paying seconds of job latency (measured live: ~7 s/row).
-        A single 2,000-row INSERT is one job. Sub-batch size keeps the bind
-        parameter count (rows x columns) under BigQuery's 10,000-per-query
-        limit with room to spare.
+        """Load job instead of DML INSERT. An earlier version batched DML
+        INSERT statements (2,000 rows/statement) -- a real improvement over
+        one-job-per-row, but still bottlenecked on DML job overhead:
+        measured live, ~250-325 rows/s sustained. A load job writes the
+        whole batch in one job with no per-statement cost, and -- unlike
+        DML -- load jobs are free: they don't count against the query/DML
+        byte quota or billing. Measured live: ~900 rows/s, ~3x the DML
+        version.
+
+        Blocks on `.result()` deliberately, even though it's tempting to
+        submit jobs without waiting so the next batch's API fetch can run
+        while this one is still loading server-side (BigQuery jobs are
+        already async, so no thread/queue would even be needed for that).
+        Tried it live: BigQuery caps table *update* operations (loads
+        count) at a low rate regardless of whether earlier ones finished,
+        and unblocked submission blew straight through it --
+        `429 too many table update operations for this table`, a hard
+        platform limit, not a quota this project can raise. The blocking
+        `.result()` call is what was keeping submissions naturally paced
+        under that limit; it stays.
+
+        Bypasses SQLAlchemy's INSERT compilation and bind processors
+        entirely, so payload serialization is done by hand here, reusing
+        the staging table's own `payload` column type (`PortableJSON`) so
+        the two paths can never drift out of sync with each other.
         """
-        for i in range(0, len(rows), 2_000):
-            conn.execute(insert(table).values(rows[i : i + 2_000]))
+        from google.cloud import bigquery
+
+        client = conn.connection.driver_connection._client
+        table_ref = bigquery.DatasetReference(client.project, conn.engine.url.database).table(table.name)
+        payload_type = table.c.payload.type
+
+        json_rows = []
+        for row in rows:
+            json_row = {
+                "_natural_key": row["_natural_key"],
+                "_row_hash": row["_row_hash"],
+                "payload": payload_type.process_bind_param(row["payload"], None),
+            }
+            if "_reg_date" in row:
+                json_row["_reg_date"] = row["_reg_date"].isoformat()
+            json_rows.append(json_row)
+
+        client.load_table_from_json(json_rows, table_ref).result()
 
 
 _ADAPTERS: Dict[str, Type[DialectAdapter]] = {

@@ -6,10 +6,14 @@
 #
 #   0 2 * * * BDNS_SYNC_TARGET_URL=bigquery://project/dataset /path/to/scripts/delta_load.sh
 #
-# Windows cascade, they don't replace each other: daily always runs, and
-# weekly/monthly/annual are *additional* re-verification passes on the same
-# day (e.g. Jan 1st on a Sunday runs daily + weekly + monthly + annual, all
-# in the same invocation), per the "Endpoint types" section of the README.
+# Windows are nested, not independent: every window ends at yesterday
+# (window_bounds in generic.py), so annual ⊃ monthly ⊃ weekly ⊃ daily on any
+# given day. Running the widest window that applies today already covers
+# every narrower one for free -- running daily too on a day that's also
+# monthly would just re-fetch and re-diff yesterday's range a second time
+# for zero extra detection. So exactly one window runs per day, the widest
+# that applies (e.g. Jan 1st on a Sunday runs annual only, not daily +
+# weekly + monthly + annual stacked).
 set -euo pipefail
 
 : "${BDNS_SYNC_TARGET_URL:?set BDNS_SYNC_TARGET_URL to the target DB URL}"
@@ -44,7 +48,12 @@ run_window() {
   bdns-sync sync convocatorias --window "$window"
 }
 
-run_window daily
-if [ "$(date +%u)" = 7 ]; then run_window weekly; fi          # Sunday
-if [ "$(date +%d)" = 01 ]; then run_window monthly; fi        # 1st of month
-if [ "$(date +%m-%d)" = 01-01 ]; then run_window annual; fi   # Jan 1st
+if [ "$(date +%m-%d)" = 01-01 ]; then
+  run_window annual                        # Jan 1st
+elif [ "$(date +%d)" = 01 ]; then
+  run_window monthly                       # 1st of month
+elif [ "$(date +%u)" = 7 ]; then
+  run_window weekly                        # Sunday
+else
+  run_window daily
+fi

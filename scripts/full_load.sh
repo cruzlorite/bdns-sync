@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# One-time historical backfill for the reg-date incremental endpoints.
+# One-time bootstrap of a fresh target: every full-replace catalog, then
+# the deep historical backfill of the reg-date incremental endpoints.
 # bdns-sync itself is a pure primitive with no idea how far back each
 # endpoint's data goes, so -- like delta_load.sh owns the cadence -- this
 # script owns the earliest dates. It calls `bdns-sync sync <entity> --since
@@ -23,6 +24,13 @@ set -euo pipefail
 
 : "${BDNS_SYNC_TARGET_URL:?set BDNS_SYNC_TARGET_URL to the target DB URL}"
 
+echo "=== full-replace catalogs ==="
+for entity in $(bdns-sync list --kind full); do
+  echo ">>> $entity"
+  bdns-sync sync "$entity"
+done
+
+echo "=== historical backfills ==="
 # entity                       earliest reg-date worth requesting (see README)
 backfill() { echo ">>> backfill $1 --since $2"; bdns-sync sync "$1" --since "$2"; }
 
@@ -30,5 +38,5 @@ backfill concesiones_busqueda        2020-01-01   # ~4y retention
 backfill partidospoliticos_busqueda  2020-01-01   # tracks concesiones
 backfill ayudasestado_busqueda       2015-01-01   # ~10y retention
 backfill minimis_busqueda            2015-01-01   # ~10y retention
-backfill convocatorias_busqueda       2013-01-01   # back to portal start
+backfill convocatorias_busqueda      2013-01-01   # back to portal start
 backfill convocatorias               2013-01-01   # back to portal start

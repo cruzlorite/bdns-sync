@@ -155,7 +155,7 @@ Endpoints with tens of millions of rows, where full replacement is not viable.
 
 The detail step of `convocatorias` is the expensive one: one real API call per discovered code, with no pagination possible (a single call returns a single record). Measured live with a real month (May 2026, 6,186 codes), running it sequentially took anywhere from 23 minutes to 3 h 12 min depending on server load. The detail step is parallelized (8 workers, request starts paced at ~9.5 req/s, just under the 10/s cap) to approach the official rate limit instead of being bound to single-connection latency; the same month took 10 min 54 s in parallel, with zero `429`s.
 
-A record's registration date does not change when the record is edited, so re-querying the same window later finds no new additions, but does detect edits via the hash. Corrections cluster near the registration date and taper off with age; hence the window cascade: `daily` always runs, and `weekly`/`monthly`/`annual` are additional same-day checks, not replacements for the daily run.
+A record's registration date does not change when the record is edited, so re-querying the same window later finds no new additions, but does detect edits via the hash. Corrections cluster near the registration date and taper off with age; hence the window cascade: every level reaches back to yesterday (`window_bounds`), so `annual ⊃ monthly ⊃ weekly ⊃ daily` on any given day. `scripts/delta_load.sh` runs only the widest one that applies that day (annual on Jan 1st, monthly on the 1st, weekly on Sunday, daily otherwise), never stacked: the widest already covers the narrower ones entirely, so stacking would just re-fetch and re-diff the same range twice for no extra detection.
 
 ## Date windows and historical load
 

@@ -18,6 +18,25 @@ import json
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 
+def _order_independent(value: Any) -> Any:
+    """Recursively sort list elements so hashing doesn't care about array
+    order. Confirmed live on `regiones`: the API returns the same tree
+    `children` in a different element order across calls, with no field
+    actually changed -- without this, every re-sync produced a spurious
+    SCD2 version for any key with a reordered nested array.
+
+    Dict key order is already handled by `json.dumps(sort_keys=True)`
+    (recursively); only list element order needs normalizing here, by
+    sorting on each element's own canonical JSON string.
+    """
+    if isinstance(value, dict):
+        return {k: _order_independent(v) for k, v in value.items()}
+    if isinstance(value, list):
+        items = [_order_independent(v) for v in value]
+        return sorted(items, key=lambda v: json.dumps(v, sort_keys=True, ensure_ascii=False, default=str))
+    return value
+
+
 def canonical_json(
     payload: Dict[str, Any], exclude_fields: Optional[Iterable[str]] = None
 ) -> str:
@@ -25,7 +44,7 @@ def canonical_json(
         excluded = set(exclude_fields)
         payload = {k: v for k, v in payload.items() if k not in excluded}
     return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        _order_independent(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
     )
 
 

@@ -17,11 +17,13 @@ orchestration concern that lives outside this package (see scripts/).
 """
 
 import logging
+import sys
 from datetime import date
 from typing import Optional
 
 import typer
 
+import bdns.fetch.client as _bdns_fetch_client
 from bdns.fetch import BDNSClient
 from bdns.sync import __version__
 from bdns.sync.generic import WINDOWS
@@ -70,6 +72,14 @@ def main(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         force=True,
     )
+    if not sys.stderr.isatty():
+        # bdns-fetch's pagination progress bar writes bare `\r` updates with
+        # no trailing newline, meant for an interactive terminal. Piped to a
+        # log file (cron, background runs) that leaves a stale progress
+        # fragment glued to the front of the next log line. No public knob
+        # on BDNSClient to disable it, so silence it here instead -- only
+        # when output isn't a real terminal, so interactive use keeps it.
+        _bdns_fetch_client.tqdm = lambda iterable, *args, **kwargs: iterable
 
 
 TARGET_URL_OPTION = typer.Option(
@@ -123,6 +133,8 @@ def sync(
     since_date = _parse_iso_date(since, "--since")
     until_date = _parse_iso_date(until, "--until")
 
+    # Outcome (row counts, duration) is logged by bookkeeping.run_with_bookkeeping;
+    # no separate echo here to avoid printing the same summary twice.
     if endpoint == CONVOCATORIAS_ENDPOINT or endpoint in SEARCH_SYNCERS:
         sync_fn = sync_convocatorias if endpoint == CONVOCATORIAS_ENDPOINT else SEARCH_SYNCERS[endpoint]
         if since_date is not None:
@@ -130,19 +142,17 @@ def sync(
                 raise typer.BadParameter("use either --window or --since, not both")
             if until_date is not None and until_date < since_date:
                 raise typer.BadParameter("--until must not be before --since")
-            stats = sync_fn(sink, client, since=since_date, until=until_date)
+            sync_fn(sink, client, since=since_date, until=until_date)
         elif window is not None:
             if window not in WINDOWS:
                 raise typer.BadParameter(f"window must be one of {', '.join(WINDOWS)}")
-            stats = sync_fn(sink, client, window)
+            sync_fn(sink, client, window)
         else:
             raise typer.BadParameter(f"{endpoint} requires --window or --since")
     elif endpoint in FULL_SYNCERS:
-        stats = FULL_SYNCERS[endpoint](sink, client)
+        FULL_SYNCERS[endpoint](sink, client)
     else:
         raise typer.BadParameter(f"unknown endpoint: {endpoint}")
-
-    typer.echo(f"{endpoint}: {stats}")
 
 
 @app.command(name="list")
