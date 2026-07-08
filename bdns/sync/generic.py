@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 """Shared sync shapes reused by several entity modules. Each entity module
 still owns its own name, key fields, and any real one-off logic. Only the
@@ -18,8 +7,9 @@ mechanical "fetch, then apply" plumbing lives here.
 
 import inspect
 import logging
+from collections.abc import Iterator, Sequence
 from datetime import date, timedelta
-from typing import Dict, Iterator, Optional, Sequence, Tuple
+from typing import Optional
 
 from bdns.fetch import BDNSClient
 from bdns.sync.sinks import Sink
@@ -32,7 +22,7 @@ def all_pages(fetch):
     """Wrap a client fetch method so paginated endpoints return EVERY page.
 
     bdns-fetch's `num_pages` option defaults to 1, which silently truncates
-    any response bigger than one page (pageSize max 10,000) -- caught live:
+    any response bigger than one page (pageSize max 10,000). Caught live:
     grandesbeneficiarios_busqueda returned 10,000 of 142,260 rows. Passing
     `num_pages=0` ("all pages") on every call is the fix, but only the
     paginated methods accept the parameter, so it's added by signature
@@ -51,7 +41,7 @@ def all_pages(fetch):
 # window name -> reg-date window size in days. Shared by every entity that
 # does cascading re-verification (concesiones, ayudasestado, minimis,
 # partidospoliticos, convocatorias).
-WINDOWS: Dict[str, int] = {
+WINDOWS: dict[str, int] = {
     "daily": 1,
     "weekly": 7,
     "monthly": 30,
@@ -67,7 +57,7 @@ WINDOWS: Dict[str, int] = {
 CHUNK_DAYS = 7
 
 
-def iter_date_chunks(start: date, end: date, chunk_days: int = CHUNK_DAYS) -> Iterator[Tuple[date, date]]:
+def iter_date_chunks(start: date, end: date, chunk_days: int = CHUNK_DAYS) -> Iterator[tuple[date, date]]:
     """Split [start, end] (inclusive) into chunks of at most `chunk_days`,
     contiguous and non-overlapping. Yields (start, end) is always at least
     one item even if `start == end`.
@@ -93,22 +83,22 @@ def to_api_upper_bound(inclusive_end: date) -> date:
     `fechaRegFin=end`, `daily` (start == end) fetches almost nothing, and
     every wider window silently drops its most recent day per chunk.
 
-    So the single, named, deliberate bridge: to include every registration
-    made on `inclusive_end`, ask the API for the day after. This is the only
-    place that crosses from our inclusive convention to the API's half-open
-    one -- keep it here, not inlined as a `+ 1` at call sites.
+    To include every registration made on `inclusive_end`, ask the API for
+    the day after. This function is the only place that crosses from the
+    codebase's inclusive convention to the API's half-open one. Keep it
+    here, not inlined as a `+ 1` at call sites.
 
     IMPORTANT: this is NOT universal. convocatorias' discovery uses a
     different parameter, `fechaHasta`, which is INCLUSIVE (also confirmed
     live: `fechaHasta=D` returns the full day D). That path must NOT call
-    this function -- see `syncers.discover_convocatoria_codes`.
+    this function; see `syncers.discover_convocatoria_codes`.
     """
     return inclusive_end + timedelta(days=1)
 
 
 def sync_full_catalog(
     sink: Sink, client: BDNSClient, endpoint_name: str, fetch_method_name: str, key_fields: Sequence[str]
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """Fetch everything with one no-arg call, full-reconcile every run."""
     fetch = all_pages(getattr(client, fetch_method_name))
     return sink.sync_full(endpoint_name, fetch(), key_fields)
@@ -122,7 +112,7 @@ def sync_swept_catalog(
     sweep_param: str,
     sweep_values: Sequence[str],
     key_fields: Sequence[str],
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """Sweep `sweep_param` across `sweep_values`, merging into one table
     before reconciling. Reconciling per sweep value would wrongly close out
     the other values' rows as "missing". The sweep value is tagged onto the
@@ -140,7 +130,7 @@ def sync_swept_catalog(
     return sink.sync_full(endpoint_name, rows(), key_fields)
 
 
-def window_bounds(window: str) -> Tuple[date, date]:
+def window_bounds(window: str) -> tuple[date, date]:
     """Map a cascade window name to its inclusive `[start, end]` range. `end`
     is always yesterday (see `to_api_upper_bound` for why today is excluded).
     """
@@ -151,9 +141,9 @@ def window_bounds(window: str) -> Tuple[date, date]:
 
 def resolve_when(
     window: Optional[str], since: Optional[date], until: Optional[date]
-) -> Tuple[date, date, str]:
-    """Turn the two ways of asking for a reg-date range -- a named cascade
-    `window`, or an explicit `since`/`until` backfill range -- into a single
+) -> tuple[date, date, str]:
+    """Turn the two ways of asking for a reg-date range (a named cascade
+    `window`, or an explicit `since`/`until` backfill range) into a single
     `(start, end, run_type)` triple.
 
     An explicit `since` wins over `window` and marks the run as "backfill"
@@ -179,10 +169,10 @@ def sync_search_range(
     start: date,
     end: date,
     run_type: str,
-    reg_date_field: str = None,
-) -> Dict[str, int]:
+    reg_date_field: Optional[str] = None,
+) -> dict[str, int]:
     """Fetch the reg-date range `[start, end]` and apply incrementally. Used
-    for both cascade windows (a few days back) and backfills (years back) --
+    for both cascade windows (a few days back) and backfills (years back);
     same machinery, only the range and `run_type` label differ.
 
     By default this never closes out keys, since a range is a subset of the
@@ -220,14 +210,14 @@ def sync_search_range_inclusive(
     start: date,
     end: date,
     run_type: str,
-    reg_date_field: str = None,
-) -> Dict[str, int]:
+    reg_date_field: Optional[str] = None,
+) -> dict[str, int]:
     """Same shape as `sync_search_range`, for the OTHER date-parameter family:
     `fechaDesde`/`fechaHasta`, which is INCLUSIVE on the upper bound (unlike
-    `fechaRegFin`). Used by `convocatorias` and `convocatorias_busqueda`,
-    confirmed live -- `fechaHasta=D` already returns the full day `D`, so
-    `chunk_end` is passed as-is, with NO `to_api_upper_bound` bridge. Calling
-    that bridge here would over-fetch one extra day past the window.
+    `fechaRegFin`; see `to_api_upper_bound` and section 2 of
+    docs/bdns-api-behavior.md).
+    `chunk_end` is passed as-is, with NO `to_api_upper_bound` bridge.
+    Calling it here would over-fetch one extra day past the window.
     """
     fetch = all_pages(getattr(client, fetch_method_name))
 

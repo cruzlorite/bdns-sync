@@ -30,7 +30,7 @@ from bdns.sync.syncers import (
     sync_sectores,
 )
 from tests.fake_client import FakeBDNSClient
-from tests.timeline_helpers import current_rows, all_rows, fresh_copy_with_new_key
+from tests.timeline_helpers import all_rows, current_rows, fresh_copy_with_new_key
 
 # (sync_fn, client attribute holding the fixture list, table name, key
 # fields matching the syncer's own key_fields, a non-key field safe to

@@ -1,40 +1,26 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Storage abstraction: everything above this package fetches rows; a Sink
-persists them.
+"""Storage abstraction. Everything above this package fetches rows; a
+Sink persists them.
 
-The boundary is deliberately batch-oriented, not row-oriented. A sink is
-never asked to "insert this row" or "update that one" -- it is handed the
-complete batch of rows one sync run fetched, plus enough context to
-version them (key fields, and for windowed runs the date range), and it
-owns everything storage-side from there: table/file creation, SCD2
-versioning, deletion detection, run logging, error records. That contract
-is the widest one every conceivable target can honor: an UPDATE-capable
-SQL engine implements it with staging plus bulk diff statements, while an
-append-only target (a future Parquet sink) would implement the same
-contract with partition writes and compaction. Anything narrower (per-row
-CRUD) would silently assume SQL and make non-SQL sinks impossible.
+The interface is batch-oriented on purpose. A sink receives the complete
+batch of rows one sync run fetched, plus the context needed to version
+them (key fields, and the date range for windowed runs), and owns
+everything storage-side from there: table creation, SCD2 versioning,
+deletion detection, run logging, error records. A per-row CRUD interface
+would assume an UPDATE-capable SQL engine; the batch contract can also be
+implemented by an append-only target such as a future Parquet sink.
 
-Currently implemented: `sql.SQLSink`, covering every target with a
-SQLAlchemy dialect (SQLite, PostgreSQL, MySQL, BigQuery, ...). Per-engine
-quirks live inside that package (see `sql.dialects`); they never leak
+The only implementation today is `sql.SQLSink`, which covers every target
+with a SQLAlchemy dialect (SQLite, PostgreSQL, MySQL, BigQuery). Engine
+quirks stay inside that package (see `sql.dialects`) and never leak
 through this interface.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from datetime import date
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Optional
 
 
 class Sink(ABC):
@@ -78,29 +64,28 @@ class Sink(ABC):
     def sync_full(
         self,
         endpoint: str,
-        rows: Iterable[Dict[str, Any]],
+        rows: Iterable[dict[str, Any]],
         key_fields: Sequence[str],
         *,
-        skipped: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, int]:
+        skipped: Optional[list[dict[str, str]]] = None,
+    ) -> dict[str, int]:
         """Reconcile `endpoint` against `rows` as its COMPLETE current state.
 
         Args:
-            endpoint: Logical entity name; also the storage-side name (table,
-                file prefix, ...) the sink keeps this entity under.
-            rows: The full set of currently-existing records, as returned by
-                the API. May be a lazy generator; it is consumed exactly once.
-                Records are stored whole -- the sink never interprets payload
-                fields beyond extracting `key_fields`.
-            key_fields: Payload field names whose values form the natural key.
-                Order matters (it is part of the serialized key).
-            skipped: Optional list of malformed-record descriptors (dicts with
-                `context` and `content` keys). The caller may keep appending
-                to it WHILE `rows` is being consumed (the typical pattern is a
-                generator that skips bad records and logs them here); the sink
-                reads it only after `rows` is exhausted, persists each entry
-                to its error log linked to this run, and reports the count as
-                `skipped` in the returned stats.
+            endpoint: Logical entity name, also used as the storage-side
+                name (table, file prefix) for this entity.
+            rows: The full set of currently-existing records, as returned
+                by the API. May be a lazy generator; it is consumed exactly
+                once. Records are stored whole; the sink never reads
+                payload fields beyond extracting `key_fields`.
+            key_fields: Payload field names whose values form the natural
+                key. Order matters; it is part of the serialized key.
+            skipped: Optional list of malformed-record descriptors (dicts
+                with `context` and `content` keys). The caller may keep
+                appending to it while `rows` is being consumed; the sink
+                reads it only after `rows` is exhausted, persists each
+                entry to its error log linked to this run, and reports the
+                count as `skipped` in the returned stats.
 
         Returns:
             Stats dict (see class docstring). Because `rows` is the complete
@@ -112,15 +97,15 @@ class Sink(ABC):
     def sync_window(
         self,
         endpoint: str,
-        rows: Iterable[Dict[str, Any]],
+        rows: Iterable[dict[str, Any]],
         key_fields: Sequence[str],
         *,
         window_start: date,
         window_end: date,
         run_type: str,
         reg_date_field: Optional[str] = None,
-        skipped: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, int]:
+        skipped: Optional[list[dict[str, str]]] = None,
+    ) -> dict[str, int]:
         """Apply `rows` as the slice of `endpoint` registered in a date range.
 
         Unlike `sync_full`, absence from `rows` proves nothing on its own:
@@ -132,7 +117,7 @@ class Sink(ABC):
             endpoint: Same as in `sync_full`.
             rows: Every record whose registration date falls in
                 `[window_start, window_end]` (both inclusive), as fetched
-                from the API. Lazy generators welcome, consumed once.
+                from the API. May be a lazy generator; consumed once.
             key_fields: Same as in `sync_full`.
             window_start: First day of the fetched range, inclusive.
             window_end: Last day of the fetched range, inclusive. Both bounds
@@ -146,7 +131,7 @@ class Sink(ABC):
                 registration date. When given, a stored current version is
                 closed if its registration date falls inside
                 `[window_start, window_end]` and its key is absent from
-                `rows` -- both sides of the comparison then cover the same
+                `rows`. Both sides of the comparison then cover the same
                 fixed range, which is what makes absence meaningful. Entities
                 whose payload exposes no such field must leave this None and
                 get no deletion detection on windowed runs.
@@ -159,12 +144,12 @@ class Sink(ABC):
 
 
 def get_sink(url: str) -> Sink:
-    """Build the sink for a target URL. The URL scheme picks the
-    implementation; today every scheme is a SQLAlchemy dialect and maps to
-    `sql.SQLSink` (e.g. `sqlite:///...`, `postgresql://...`,
-    `bigquery://project/dataset`). A future file-based sink would claim its
-    own scheme here (e.g. `parquet:///path`) -- this factory is the single
-    place that decision lives.
+    """Build the sink for a target URL.
+
+    The URL scheme picks the implementation. Today every scheme is a
+    SQLAlchemy dialect and maps to `sql.SQLSink` (`sqlite:///...`,
+    `postgresql://...`, `bigquery://project/dataset`). A future file-based
+    sink would claim its own scheme here, e.g. `parquet:///path`.
     """
     from bdns.sync.sinks.sql import SQLSink
 

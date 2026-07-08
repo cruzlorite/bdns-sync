@@ -20,14 +20,15 @@ scenarios.
 """
 
 import json
+from collections.abc import Iterable
 from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-_CACHE: Dict[str, Any] = {}
+_CACHE: dict[str, Any] = {}
 
 
 def load_fixture(name: str):
@@ -54,7 +55,7 @@ REG_DATE_FIELDS = {
 }
 
 
-def _patch_reg_dates(records: List[dict], field: str) -> None:
+def _patch_reg_dates(records: list[dict], field: str) -> None:
     for rec in records:
         rec["payload"][field] = reg_date(rec["reg_days_ago"]).isoformat()
 
@@ -123,7 +124,7 @@ class FakeBDNSClient:
         self.planesestrategicos_detail = load_fixture("planesestrategicos_detail")
         self.planesestrategicos_vigencia = load_fixture("planesestrategicos_vigencia")
 
-        self.calls: List[tuple] = []  # (method_name, kwargs) audit log
+        self.calls: list[tuple] = []  # (method_name, kwargs) audit log
 
     # Simple full-replace catalogs, no arguments.
 
@@ -264,5 +265,5 @@ class FakeBDNSClient:
 
     # Test helpers.
 
-    def calls_to(self, method: str) -> List[dict]:
+    def calls_to(self, method: str) -> list[dict]:
         return [kwargs for name, kwargs in self.calls if name == method]

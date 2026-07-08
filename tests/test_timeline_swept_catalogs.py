@@ -12,10 +12,10 @@ from copy import deepcopy
 import pytest
 from sqlalchemy import create_engine
 
-from bdns.sync.syncers import sync_organos, sync_organos_agrupacion, sync_reglamentos
 from bdns.sync.sinks.sql import SQLSink
+from bdns.sync.syncers import sync_organos, sync_organos_agrupacion, sync_reglamentos
 from tests.fake_client import FakeBDNSClient
-from tests.timeline_helpers import current_rows, all_rows
+from tests.timeline_helpers import all_rows, current_rows
 
 # (sync_fn, client dict attribute, table name, sweep value populated by the
 # fixture, a second sweep value that starts empty, a field safe to mutate)

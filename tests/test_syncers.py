@@ -2,8 +2,8 @@ from datetime import date, timedelta
 
 from sqlalchemy import MetaData, create_engine, select
 
-from bdns.sync.sinks.sql.schema import build_sync_table
 from bdns.sync.sinks.sql import SQLSink
+from bdns.sync.sinks.sql.schema import build_sync_table
 from bdns.sync.syncers import (
     sync_convocatorias,
     sync_grandesbeneficiarios_busqueda,

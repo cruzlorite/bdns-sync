@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 """bdns-sync is a pure parameterized tool: one endpoint per invocation, no
 config file, no cadence knowledge. Which endpoints to sync and when is an
@@ -28,12 +17,7 @@ from bdns.fetch import BDNSClient
 from bdns.sync import __version__
 from bdns.sync.generic import WINDOWS
 from bdns.sync.sinks import get_sink
-from bdns.sync.syncers import (
-    CONVOCATORIAS_ENDPOINT,
-    FULL_SYNCERS,
-    SEARCH_SYNCERS,
-    sync_convocatorias,
-)
+from bdns.sync.syncers import FULL_SYNCERS, SEARCH_SYNCERS
 
 app = typer.Typer(
     name="bdns-sync",
@@ -77,8 +61,8 @@ def main(
         # no trailing newline, meant for an interactive terminal. Piped to a
         # log file (cron, background runs) that leaves a stale progress
         # fragment glued to the front of the next log line. No public knob
-        # on BDNSClient to disable it, so silence it here instead -- only
-        # when output isn't a real terminal, so interactive use keeps it.
+        # on BDNSClient to disable it, so silence it here instead. Only
+        # applies when output isn't a real terminal; interactive use keeps it.
         _bdns_fetch_client.tqdm = lambda iterable, *args, **kwargs: iterable
 
 
@@ -96,7 +80,7 @@ def _parse_iso_date(value: Optional[str], flag: str) -> Optional[date]:
     try:
         return date.fromisoformat(value)
     except ValueError:
-        raise typer.BadParameter(f"{flag} must be an ISO date (YYYY-MM-DD), got {value!r}")
+        raise typer.BadParameter(f"{flag} must be an ISO date (YYYY-MM-DD), got {value!r}") from None
 
 
 @app.command()
@@ -128,15 +112,19 @@ def sync(
     ignore all of these.
     """
     sink = get_sink(target_url)
-    client = BDNSClient()
+    # Defaults (3 retries, 2s fixed wait) give up after ~1 minute of server
+    # trouble; a real multi-hour backfill died live to one request timing
+    # out 3 times in a row. 8 x 15s rides out a ~2-minute server rough patch;
+    # the only cost is extra delay before a genuinely permanent failure.
+    client = BDNSClient(max_retries=8, wait_time=15)
 
     since_date = _parse_iso_date(since, "--since")
     until_date = _parse_iso_date(until, "--until")
 
     # Outcome (row counts, duration) is logged by bookkeeping.run_with_bookkeeping;
     # no separate echo here to avoid printing the same summary twice.
-    if endpoint == CONVOCATORIAS_ENDPOINT or endpoint in SEARCH_SYNCERS:
-        sync_fn = sync_convocatorias if endpoint == CONVOCATORIAS_ENDPOINT else SEARCH_SYNCERS[endpoint]
+    if endpoint in SEARCH_SYNCERS:
+        sync_fn = SEARCH_SYNCERS[endpoint]
         if since_date is not None:
             if window is not None:
                 raise typer.BadParameter("use either --window or --since, not both")
@@ -157,9 +145,7 @@ def sync(
 
 @app.command(name="list")
 def list_endpoints(
-    kind: str = typer.Option(
-        "full", "--kind", help="one of: full, search, convocatorias"
-    ),
+    kind: str = typer.Option("full", "--kind", help="one of: full, search"),
 ) -> None:
     """List known endpoint names, one per line, for scripting (no hardcoded lists)."""
     if kind == "full":
@@ -168,7 +154,5 @@ def list_endpoints(
     elif kind == "search":
         for name in SEARCH_SYNCERS:
             typer.echo(name)
-    elif kind == "convocatorias":
-        typer.echo(CONVOCATORIAS_ENDPOINT)
     else:
-        raise typer.BadParameter("kind must be one of: full, search, convocatorias")
+        raise typer.BadParameter("kind must be one of: full, search")

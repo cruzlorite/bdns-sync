@@ -25,7 +25,7 @@ En `convocatorias`, los parámetros de fecha solo intervienen en el paso de desc
 
 El coste de `convocatorias` es por tanto lineal en el número de códigos, no en el ancho de la ventana. Medido en vivo con un mes real (mayo de 2026, 6.186 códigos): el descubrimiento tarda ~1 s, y el paso de detalle domina por completo. La latencia por llamada de detalle varía con la carga del servidor: ~0,22 s/llamada en horario favorable (un mes ≈ 23 minutos), pero una ejecución completa del mismo mes llegó a tardar 3 h 12 min (~1,9 s/llamada) con un único reintento por timeout. La ejecución terminó con éxito en ambos regímenes (6.186 filas, 0 descartes); solo cambia la duración.
 
-**Paso de detalle paralelizado.** Al ser una llamada por código sin paginación, el bucle secuencial original quedaba muy por debajo del límite de 10 peticiones/segundo (0,5-4,5 req/s reales según el régimen medido arriba). Se probó paralelizar con un pool de hilos: 10 hilos contra el limitador de tokens compartido del cliente provocó `HTTP 429 Too Many Requests` en segundos -- el bucket de tokens arranca lleno, así que el primer lote de un pool nuevo dispara sus peticiones simultáneas, y el servidor rechaza la ráfaga aunque el promedio declarado sea 10/s. Se confirmó en vivo que el servidor sí sostiene ~9,8 req/s sin ningún 429 cuando los *inicios* de petición se espacian 100 ms entre sí (round-robin entre 5-8 hilos, cada uno bloqueado por ese espaciado antes de disparar). La implementación final espacia arranques a 105 ms (margen bajo el límite) con 8 hilos; el mismo mes de mayo de 2026 tardó 10 min 54 s en paralelo frente a 23 min-3h12min en secuencial, sin ningún 429.
+El paso de detalle está paralelizado para acercarse al límite de 10 req/s en vez de quedar atado a la latencia de una sola conexión. El servidor rechaza las ráfagas, así que los arranques de petición van espaciados; el detalle medido está en la [sección 7](#7-rendimiento-medido).
 
 Consecuencias de un manejo incorrecto, medidas en vivo:
 
@@ -76,3 +76,37 @@ El alcance de una carga histórica completa lo determina la retención de datos 
 | `convocatorias` | ~12 años | Arranque del portal (~2014) |
 
 Estas fechas no están codificadas en `bdns-sync`: la herramienta es un primitivo puro y no conoce la profundidad histórica de cada endpoint. Igual que `scripts/delta_load.sh` es dueño de la cadencia, `scripts/full_load.sh` es dueño de las fechas de inicio y las pasa mediante `--since`. Consultar fechas anteriores a la retención solo devuelve semanas vacías (una llamada barata cada una), por lo que las fechas del script son suelos conservadores, no primeros registros exactos.
+
+## 7. Rendimiento medido
+
+Cifras medidas en vivo que justifican decisiones de diseño. Los detalles operativos viven junto al código (`bdns/sync/sinks/sql/dialects.py`, `bdns/sync/pipeline.py`); esto es el registro de evidencia.
+
+### Límite de peticiones y paso de detalle paralelo
+
+El límite oficial es 10 peticiones/segundo por IP. El *token bucket* del cliente lo respeta como media, pero arranca lleno: un pool de hilos nuevo dispara sus primeras peticiones simultáneamente y el servidor responde `429` a la ráfaga (comprobado en vivo: 10 hilos solo con token bucket murieron en segundos). El mismo servidor acepta 9,8 req/s sostenidas sin ningún `429` cuando los *arranques* de petición van espaciados (comprobado a 100 ms); el espaciado usado es 105 ms.
+
+Con un mes real de `convocatorias` (mayo de 2026, 6.186 códigos): el paso de detalle secuencial tardó entre 23 minutos y 3 h 12 min según la carga del servidor (0,2-1,9 s/llamada); en paralelo (8 hilos, arranques espaciados) tardó 10 min 54 s, sin ningún `429`.
+
+### Solape productor/consumidor
+
+El staging solapa el fetch del lote siguiente con la escritura del actual (`bdns/sync/pipeline.py`): +40% medido en endpoints donde el fetch pesa. El fetch va en el hilo auxiliar y la escritura en el hilo dueño de la conexión porque los objetos DBAPI de SQLite tienen afinidad de hilo; la cola acotada hace de contrapresión.
+
+### Fiabilidad de rangos largos
+
+Un rango de 7 días contra `concesiones_busqueda` trajo 147.856 filas sin errores; un rango de 4 años falló de forma intermitente con `ERR_MANTENIMIENTO_BBDD` a cualquier profundidad de página. De ahí el troceo universal en piezas de 7 días (ver [sección 3](#3-troceo-de-ventanas-en-piezas-de-7-días)).
+
+### Reintentos del cliente
+
+Los valores por defecto de `bdns-fetch` (3 reintentos, espera fija de 2 s) abandonan tras ~1 minuto de problemas del servidor: un backfill real de varias horas murió por una única petición que agotó sus 3 intentos. Con 8 × 15 s se sobrevive a un bache de ~2 minutos; el único coste es más retraso ante un fallo genuinamente permanente.
+
+## 8. Problemas conocidos del API
+
+Lista consolidada de los comportamientos problemáticos del API, todos verificados en vivo. El resto del proyecto (README, comentarios del código) enlaza aquí en lugar de repetir cada explicación.
+
+- **Registros individuales malformados.** El backend rechaza a veces un registro concreto con una página de error HTML en lugar de JSON. No es un límite de tasa ni un problema de parámetros: las llamadas inmediatamente anteriores y posteriores al mismo registro funcionan. `bdns-sync` descarta el registro con un aviso, lo cuenta en `_sync_runs.rows_skipped` y lo guarda en `_sync_errors`.
+- **`ERR_MANTENIMIENTO_BBDD` en rangos largos.** Los rangos de fechas de varios años fallan de forma intermitente a cualquier profundidad de página. Por eso toda consulta se trocea en piezas de 7 días; ver [sección 3](#3-troceo-de-ventanas-en-piezas-de-7-días).
+- **Semántica de fechas inconsistente entre endpoints.** `fechaRegFin` es exclusivo y `fechaHasta` es inclusivo, sin que la documentación oficial lo indique. Ver [sección 2](#2-semántica-del-extremo-superior-según-el-endpoint).
+- **`partidospoliticos_busqueda` sin fecha de registro.** Su payload no expone ningún campo de fecha de registro, aunque la documentación oficial afirma que funciona igual que `concesiones_busqueda`. Sin ese campo no hay detección de bajas posible. Ver [sección 5](#5-detección-de-bajas-acotada-por-ventana).
+- **Orden no determinista de arrays anidados.** `regiones` devuelve el mismo árbol con los `children` en orden distinto entre llamadas, sin ningún cambio real. El hash canónico de `bdns-sync` ordena recursivamente claves y elementos de array para no producir versiones espurias.
+- **Rechazo de ráfagas aunque el promedio respete el límite.** El servidor responde `429` a un arranque simultáneo de peticiones aunque la media esté bajo 10 req/s. Los arranques se espacian 105 ms; ver [sección 7](#7-rendimiento-medido).
+- **Retención limitada por endpoint.** Entre ~4 y ~12 años según la entidad. Ver [sección 6](#6-profundidad-histórica-por-endpoint).

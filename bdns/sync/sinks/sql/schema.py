@@ -1,22 +1,12 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 """Generic SCD2 table shape shared by every synced endpoint, plus control tables."""
 
 import json
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     Date,
@@ -100,9 +90,16 @@ def build_staging_table(name: str, metadata: MetaData) -> Table:
     )
 
 
-def build_control_tables(metadata: MetaData) -> Tuple[Table, Table, Table]:
-    """`_sync_state` (per-table watermark), `_sync_runs` (append-only run
+def build_control_tables(metadata: MetaData) -> tuple[Table, Table, Table]:
+    """`_sync_state` (per-table watermark), `_sync_runs` (append-only event
     log), and `_sync_errors` (one row per skipped malformed record).
+
+    `_sync_runs` is an EVENT log, never updated in place: one `started` row
+    when a run begins (committed immediately, outside the data transaction)
+    and one terminal `success`/`failed` row when it ends. A run's state is
+    its latest event; a `started` with no terminal event means the process
+    died mid-run (crash, kill). A mutable status column could never record
+    that state, since a dead process can't update its own row. Row counters travel on the terminal event.
 
     `_sync_errors` is separate from the synced tables on purpose: a
     malformed record has no natural key and no real payload, so it can't be
@@ -114,7 +111,7 @@ def build_control_tables(metadata: MetaData) -> Tuple[Table, Table, Table]:
         metadata,
         Column("table_name", String, primary_key=True),
         Column("last_synced_at", DateTime(timezone=True), nullable=True),
-        Column("last_run_id", Integer, nullable=True),
+        Column("last_run_id", BigInteger, nullable=True),
         extend_existing=True,
     )
     sync_runs = Table(
@@ -122,24 +119,25 @@ def build_control_tables(metadata: MetaData) -> Tuple[Table, Table, Table]:
         metadata,
         # App-generated (epoch microseconds, see bookkeeping): DB autoincrement
         # isn't portable (BigQuery has none) and this key is read back.
-        Column("run_id", Integer, primary_key=True, autoincrement=False),
+        # BigInteger, not Integer: epoch microseconds (~1.7e15) overflow the
+        # 32-bit INTEGER Postgres/MySQL map Integer to.
+        Column("run_id", BigInteger, nullable=False, index=True),
         Column("table_name", String, nullable=False, index=True),
         Column("run_type", String, nullable=False),
-        Column("started_at", DateTime(timezone=True), nullable=False),
-        Column("finished_at", DateTime(timezone=True), nullable=True),
-        Column("rows_fetched", Integer, nullable=False, default=0),
-        Column("rows_inserted", Integer, nullable=False, default=0),
-        Column("rows_soft_deleted", Integer, nullable=False, default=0),
-        Column("rows_skipped", Integer, nullable=False, default=0),
-        Column("status", String, nullable=False),
+        Column("event", String, nullable=False),  # started | success | failed
+        Column("occurred_at", DateTime(timezone=True), nullable=False),
+        Column("rows_fetched", Integer, nullable=True),
+        Column("rows_inserted", Integer, nullable=True),
+        Column("rows_soft_deleted", Integer, nullable=True),
+        Column("rows_skipped", Integer, nullable=True),
         Column("error", String, nullable=True),
         extend_existing=True,
     )
     sync_errors = Table(
         "_sync_errors",
         metadata,
-        Column("error_id", Integer, primary_key=True, autoincrement=False),
-        Column("run_id", Integer, nullable=False, index=True),
+        Column("error_id", BigInteger, primary_key=True, autoincrement=False),
+        Column("run_id", BigInteger, nullable=False, index=True),
         Column("table_name", String, nullable=False, index=True),
         Column("context", String, nullable=False),
         Column("content", String, nullable=False),

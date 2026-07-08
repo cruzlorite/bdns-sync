@@ -1,25 +1,33 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Shared plumbing every group's `sync_*` function runs through: create
-tables, log the run in `_sync_runs`, apply the group's own fetch+SCD2 logic,
+"""Shared plumbing every `sync_*` function runs through: create tables,
+log the run in `_sync_runs`, apply the entity's own fetch and SCD2 logic,
 record the outcome, and bump the `_sync_state` watermark.
+
+Bookkeeping events are committed in their own short transactions, separate
+from the data transaction. Inside the data transaction they would inherit
+its fate: on transactional engines (SQLite/Postgres) a failed run would
+roll back its own `started`/`failed` records and silently erase every
+failed run from the log. Kept separate, the log always tells the truth:
+`started` is committed before any data work, the terminal `success` is
+written only after the data transaction committed, and `failed` is written
+even though the data rolled back.
+
+Per-engine guarantee (documented in the README): on SQLite/Postgres the data
+transaction is real, so no terminal `success` event means the target table
+is untouched. On BigQuery there is no transaction at all (its DBAPI commit
+is a no-op, verified live), so a crash mid-diff can leave partially-applied
+changes, but the design converges: staging is cleared and rebuilt at the
+start of every run, and re-running the same range heals any intermediate
+state (a closed version whose key is still present simply gets its new
+current version on the next successful pass). Either way the operational
+rule is the same: no `success` event => re-run.
 """
 
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Callable, Dict
+from typing import Callable
 
 from sqlalchemy import MetaData, insert, update
 from sqlalchemy.engine import Engine
@@ -33,7 +41,7 @@ logger.addHandler(logging.NullHandler())
 
 def run_with_bookkeeping(
     engine: Engine, endpoint_name: str, run_type: str, apply_fn: Callable
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """`run_type` is a classification label for `_sync_runs`: either "full"
     (full-catalog/swept/discover-then-detail syncs) or a reg-date window name
     (daily/weekly/monthly/annual, for the incremental syncs).
@@ -48,55 +56,47 @@ def run_with_bookkeeping(
     started_at = datetime.now(timezone.utc)
     # App-generated id (epoch microseconds) instead of DB autoincrement:
     # BigQuery has none, and this key is read back (it links `_sync_errors`
-    # and the final status update). One id per run and runs are sequential
-    # per orchestrator, so microseconds can't collide.
+    # and the terminal event). One id per run and runs are sequential per
+    # orchestrator, so microseconds can't collide.
     run_id = time.time_ns() // 1_000
     logger.info("%s: run %s (%s) starting", endpoint_name, run_id, run_type)
 
-    with engine.begin() as conn:
-        conn.execute(
-            insert(sync_runs).values(
-                run_id=run_id,
-                table_name=endpoint_name,
-                run_type=run_type,
-                started_at=started_at,
-                status="running",
-                rows_fetched=0,
-                rows_inserted=0,
-                rows_soft_deleted=0,
-            )
-        )
-
-        try:
-            stats = apply_fn(conn, table, staging)
-        except Exception as exc:
-            logger.error("%s: run %s failed after %.1fs: %s", endpoint_name, run_id,
-                         (datetime.now(timezone.utc) - started_at).total_seconds(), exc)
-            conn.execute(
-                update(sync_runs)
-                .where(sync_runs.c.run_id == run_id)
-                .values(
-                    finished_at=datetime.now(timezone.utc),
-                    status="failed",
-                    error=str(exc),
+    def record_event(event: str, **extra) -> None:
+        with engine.begin() as event_conn:
+            event_conn.execute(
+                insert(sync_runs).values(
+                    run_id=run_id,
+                    table_name=endpoint_name,
+                    run_type=run_type,
+                    event=event,
+                    occurred_at=datetime.now(timezone.utc),
+                    **extra,
                 )
             )
-            raise
 
-        finished_at = datetime.now(timezone.utc)
-        skip_details = stats.pop("_skip_details", [])
-        conn.execute(
-            update(sync_runs)
-            .where(sync_runs.c.run_id == run_id)
-            .values(
-                finished_at=finished_at,
-                status="success",
-                rows_fetched=stats["fetched"],
-                rows_inserted=stats["inserted"] + stats["updated"],
-                rows_soft_deleted=stats.get("soft_deleted", 0),
-                rows_skipped=stats.get("skipped", 0),
-            )
-        )
+    record_event("started")
+
+    try:
+        with engine.begin() as conn:
+            stats = apply_fn(conn, table, staging)
+    except Exception as exc:
+        logger.error("%s: run %s failed after %.1fs: %s", endpoint_name, run_id,
+                     (datetime.now(timezone.utc) - started_at).total_seconds(), exc)
+        record_event("failed", error=str(exc))
+        raise
+
+    # Terminal bookkeeping runs AFTER the data transaction committed, so a
+    # `success` event can never describe rolled-back data.
+    finished_at = datetime.now(timezone.utc)
+    skip_details = stats.pop("_skip_details", [])
+    record_event(
+        "success",
+        rows_fetched=stats["fetched"],
+        rows_inserted=stats["inserted"] + stats["updated"],
+        rows_soft_deleted=stats.get("soft_deleted", 0),
+        rows_skipped=stats.get("skipped", 0),
+    )
+    with engine.begin() as conn:
         if skip_details:
             conn.execute(
                 insert(sync_errors),

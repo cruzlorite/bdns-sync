@@ -1,44 +1,31 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Per-target adapters. The rest of the codebase writes plain, portable SQL
-(see scd2.py) that runs unchanged on SQLite, Postgres, MySQL, and BigQuery.
-This module is the one place that's allowed to know a specific engine's
-name and quirks; nothing outside it should ever branch on `dialect.name`.
+"""Per-engine adapters. The rest of the codebase writes portable SQL (see
+scd2.py) that runs unchanged on SQLite, Postgres, MySQL, and BigQuery.
+This module is the only place allowed to know a specific engine's name
+and quirks; nothing outside it should branch on `dialect.name`.
 
-BigQuery is a first-class target, not an edge case: it's expected to run
-every endpoint at real volume (concesiones_busqueda alone is 20M+ rows).
-It's also, so far, the only target that needs an adapter at all - SQLite,
-Postgres and MySQL are all covered by the DialectAdapter default.
+BigQuery is a first-class target and, so far, the only one that needs an
+adapter. SQLite, Postgres, and MySQL are covered by the DialectAdapter
+default.
 
-To support a new quirk (for this or another engine): add a method to
-DialectAdapter with a portable default (usually a no-op), override it in
-the relevant adapter subclass, and call it from whichever module hits the
-difference. `prepare_metadata` below is the existing example: BigQuery has
-no secondary indexes (CREATE INDEX is rejected outright), so its adapter
-strips them from the metadata before create_all; every other target keeps
-them via the inherited no-op.
+To handle a new quirk, add a method to DialectAdapter with a portable
+default (usually a no-op), override it in the engine's adapter, and call
+it from the module that hits the difference. `prepare_metadata` is the
+existing example: BigQuery rejects CREATE INDEX, so its adapter strips
+indexes from the metadata before create_all, while every other target
+keeps them through the inherited no-op.
 
-Scope note: this abstraction covers SQL engines only - anything that
-speaks SQLAlchemy Engine (Redshift, Snowflake, DuckDB, ... would slot in
-here as adapters). File-based targets (Parquet, Delta, ...) are a
-different axis entirely: no connection, no UPDATE, no transaction, so the
-staging+diff design in scd2.py doesn't apply to them. If one ever becomes
-a real target, it needs its own Sink interface designed around that case,
-not a DialectAdapter subclass.
+This abstraction covers SQL engines only. Anything that speaks SQLAlchemy
+Engine (Redshift, Snowflake, DuckDB) would slot in as an adapter.
+File-based targets (Parquet, Delta) have no connection, no UPDATE, and no
+transaction, so the staging-plus-diff design in scd2.py does not apply to
+them; such a target would need its own Sink implementation, not an
+adapter.
 """
 
-from typing import Any, Dict, Sequence, Type
+from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import MetaData, insert
 from sqlalchemy.engine import Connection, Engine
@@ -53,9 +40,17 @@ class DialectAdapter:
     def prepare_metadata(self, metadata: MetaData) -> None:
         """Adjust a freshly-built MetaData for this target before create_all."""
 
-    def insert_rows(self, conn: Connection, table: Table, rows: Sequence[Dict[str, Any]]) -> None:
+    def insert_rows(self, conn: Connection, table: Table, rows: Sequence[dict[str, Any]]) -> None:
         """Bulk-insert one batch of rows (scd2 staging load)."""
         conn.execute(insert(table), rows)
+
+    def staging_chunk_size(self, default: int) -> int:
+        """How many rows to buffer per `insert_rows` call. The default
+        (5,000, set by the scd2 apply functions) suits per-statement
+        engines; targets whose write cost is dominated by fixed per-call
+        overhead rather than row count override this upward.
+        """
+        return default
 
 
 class BigQueryAdapter(DialectAdapter):
@@ -63,27 +58,27 @@ class BigQueryAdapter(DialectAdapter):
         for table in metadata.tables.values():
             table.indexes.clear()
 
-    def insert_rows(self, conn: Connection, table: Table, rows: Sequence[Dict[str, Any]]) -> None:
-        """Load job instead of DML INSERT. An earlier version batched DML
-        INSERT statements (2,000 rows/statement) -- a real improvement over
-        one-job-per-row, but still bottlenecked on DML job overhead:
-        measured live, ~250-325 rows/s sustained. A load job writes the
-        whole batch in one job with no per-statement cost, and -- unlike
-        DML -- load jobs are free: they don't count against the query/DML
-        byte quota or billing. Measured live: ~900 rows/s, ~3x the DML
-        version.
+    def staging_chunk_size(self, default: int) -> int:
+        """50,000: a load job costs seconds regardless of row count, so
+        bigger batches amortize the fixed cost (and mean FEWER table-update
+        operations, i.e. more margin under BigQuery's hard 429 rate limit).
+        50,000 keeps the bounded queue's worst-case in-memory footprint
+        (3 chunks: 2 queued + 1 in flight) in the low hundreds of MB.
+        Measured figures in section 7 of docs/bdns-api-behavior.md.
+        """
+        return 50_000
 
-        Blocks on `.result()` deliberately, even though it's tempting to
-        submit jobs without waiting so the next batch's API fetch can run
-        while this one is still loading server-side (BigQuery jobs are
-        already async, so no thread/queue would even be needed for that).
-        Tried it live: BigQuery caps table *update* operations (loads
-        count) at a low rate regardless of whether earlier ones finished,
-        and unblocked submission blew straight through it --
-        `429 too many table update operations for this table`, a hard
-        platform limit, not a quota this project can raise. The blocking
-        `.result()` call is what was keeping submissions naturally paced
-        under that limit; it stays.
+    def insert_rows(self, conn: Connection, table: Table, rows: Sequence[dict[str, Any]]) -> None:
+        """Load job instead of DML INSERT: ~3-4x faster than batched DML and
+        free (load jobs don't count against the query/DML byte quota).
+        Measured figures in section 7 of docs/bdns-api-behavior.md.
+
+        Blocks on `.result()` deliberately: BigQuery caps table *update*
+        operations (loads count) at a low rate regardless of whether
+        earlier ones finished, and unblocked submission trips `429 too
+        many table update operations for this table`, a hard platform
+        limit (tried live), not a raisable quota. The blocking call is
+        what keeps submissions naturally paced under it; it stays.
 
         Bypasses SQLAlchemy's INSERT compilation and bind processors
         entirely, so payload serialization is done by hand here, reusing
@@ -110,7 +105,7 @@ class BigQueryAdapter(DialectAdapter):
         client.load_table_from_json(json_rows, table_ref).result()
 
 
-_ADAPTERS: Dict[str, Type[DialectAdapter]] = {
+_ADAPTERS: dict[str, type[DialectAdapter]] = {
     "bigquery": BigQueryAdapter,
 }
 

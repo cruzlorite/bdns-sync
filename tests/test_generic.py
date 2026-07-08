@@ -12,8 +12,8 @@ from bdns.sync.generic import (
     to_api_upper_bound,
     window_bounds,
 )
-from bdns.sync.sinks.sql.schema import build_control_tables, build_sync_table
 from bdns.sync.sinks.sql import SQLSink
+from bdns.sync.sinks.sql.schema import build_control_tables, build_sync_table
 from tests.fake_client import FakeBDNSClient, reg_date
 
 
@@ -84,7 +84,7 @@ def test_chunked_api_intervals_tile_the_range_exactly_regardless_of_chunk_size()
     rows instead of 1.2M, confirmed live). Routing every chunk end through
     `to_api_upper_bound` makes the half-open intervals
     [chunk_start, to_api_upper_bound(chunk_end)) tile the full inclusive
-    range exactly once -- every day covered, no gaps, no overlaps -- for any
+    range exactly once (every day covered, no gaps, no overlaps) for any
     chunk size. That's what makes row totals independent of how the range was
     split.
     """
@@ -196,11 +196,15 @@ def test_full_catalog_writes_rows_and_run_log():
         state_row = conn.execute(
             select(sync_state).where(sync_state.c.table_name == "widgets")
         ).mappings().one()
-        run_row = conn.execute(select(sync_runs)).mappings().one()
-        assert run_row["status"] == "success"
+        # append-only event log: exactly one started + one success event
+        events = conn.execute(
+            select(sync_runs).order_by(sync_runs.c.occurred_at)
+        ).mappings().all()
+        assert [e["event"] for e in events] == ["started", "success"]
+        assert events[1]["rows_inserted"] == 2
         # run_id is app-generated (epoch microseconds), not autoincrement;
         # the watermark must point at the run that was just logged.
-        assert state_row["last_run_id"] == run_row["run_id"]
+        assert state_row["last_run_id"] == events[1]["run_id"] == events[0]["run_id"]
 
 
 def test_full_catalog_second_run_detects_deletion():

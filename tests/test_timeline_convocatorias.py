@@ -12,8 +12,8 @@ from datetime import timedelta
 from sqlalchemy import create_engine
 
 from bdns.sync.generic import CHUNK_DAYS
-from bdns.sync.syncers import sync_convocatorias
 from bdns.sync.sinks.sql import SQLSink
+from bdns.sync.syncers import sync_convocatorias
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows, last_sync_run, sync_errors_for
 
@@ -39,7 +39,7 @@ def test_convocatorias_cascade_progressively_reveals_older_registrations():
 
 def test_convocatorias_discovery_is_chunked_for_wide_windows():
     """`monthly` (30 days) discovery must be split into <=CHUNK_DAYS-wide,
-    contiguous pieces -- a single 30-day call is exactly the range that
+    contiguous pieces. A single 30-day call is exactly the range that
     proved unreliable against the real API (see README "Limitaciones
     conocidas").
     """
@@ -48,7 +48,7 @@ def test_convocatorias_discovery_is_chunked_for_wide_windows():
     sync_convocatorias(SQLSink(engine), client, "monthly")
 
     # convocatorias' fechaHasta is INCLUSIVE, so a chunk spanning days [s, e]
-    # is sent as (s, e) directly -- no +1, unlike the fechaRegFin endpoints
+    # is sent as (s, e) directly, with no +1, unlike the fechaRegFin endpoints
     calls = sorted(client.calls_to("fetch_convocatorias_busqueda"), key=lambda c: c["start"])
     assert len(calls) > 1
     for call in calls:

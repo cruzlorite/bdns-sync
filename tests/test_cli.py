@@ -22,12 +22,7 @@ def test_list_search_includes_known_endpoints():
     result = runner.invoke(app, ["list", "--kind", "search"])
     assert result.exit_code == 0
     assert "concesiones_busqueda" in result.output
-
-
-def test_list_convocatorias():
-    result = runner.invoke(app, ["list", "--kind", "convocatorias"])
-    assert result.exit_code == 0
-    assert result.output.strip() == "convocatorias"
+    assert "convocatorias" in result.output
 
 
 def test_list_rejects_unknown_kind():

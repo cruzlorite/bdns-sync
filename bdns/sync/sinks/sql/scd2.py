@@ -1,45 +1,33 @@
-# -*- coding: utf-8 -*-
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-# You should have received a copy of the GNU General Public License along
-# with this program. If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Core SCD2 apply logic: stage the fetched batch, then diff it against the
-target table with a fixed number of bulk SQL statements, never a per-row
-UPDATE/INSERT loop.
+"""Core SCD2 apply logic: stage the fetched batch, then diff it against
+the target table with a fixed number of bulk SQL statements, never a
+per-row UPDATE/INSERT loop.
 
-That distinction is not just an optimization. On Postgres and SQLite a loop
-of per-row UPDATEs works fine, but on BigQuery (a real target for this
-project) every DML statement has real per-statement latency and cost
-regardless of how many rows it touches. A loop of thousands of individual
-UPDATEs per sync run is a bad fit at the volumes involved (concesiones_busqueda
-alone is 20M+ rows). Staging plus a handful of bulk statements costs the
-same number of statements whether the batch is 20 rows or 2 million.
+Bulk statements are a requirement, not just an optimization. On BigQuery
+every DML statement pays per-statement latency and cost regardless of how
+many rows it touches, so a loop of thousands of single-row UPDATEs does
+not scale to the volumes involved (concesiones_busqueda alone is 20M+
+rows). Staging plus a handful of bulk statements costs the same number of
+statements whether the batch is 20 rows or 2 million.
 
 Only portable SQL is used: correlated EXISTS/NOT EXISTS subqueries, no
-vendor-specific UPDATE...FROM or MERGE syntax. That's what lets the same
-code path run unchanged on SQLite, Postgres, MySQL, and BigQuery.
+vendor-specific UPDATE...FROM or MERGE. The same code path runs unchanged
+on SQLite, Postgres, MySQL, and BigQuery.
 """
 
 import logging
-import queue
-import threading
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Optional
 
 from sqlalchemy import and_, delete, exists, func, insert, literal, or_, select, true, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.schema import Table
 
-from bdns.sync.sinks.sql.dialects import get_adapter
 from bdns.sync.hashing import natural_key, row_hash
+from bdns.sync.pipeline import buffered_chunks
+from bdns.sync.sinks.sql.dialects import get_adapter
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -49,11 +37,11 @@ def apply_full_reconciliation(
     conn: Connection,
     table: Table,
     staging: Table,
-    rows: Iterable[Dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     key_fields: Sequence[str],
     exclude_hash_fields: Optional[Iterable[str]] = None,
     chunk_size: int = 5000,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """
     Diff a full batch of currently-fetched rows against the table's current rows.
 
@@ -76,14 +64,14 @@ def apply_incremental(
     conn: Connection,
     table: Table,
     staging: Table,
-    rows: Iterable[Dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     key_fields: Sequence[str],
     exclude_hash_fields: Optional[Iterable[str]] = None,
     chunk_size: int = 5000,
     reg_date_field: Optional[str] = None,
     window_start: Optional[date] = None,
     window_end: Optional[date] = None,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """
     Apply a partial/windowed batch of fetched rows (one reg-date window pass).
 
@@ -113,13 +101,13 @@ def _apply(
     conn: Connection,
     table: Table,
     staging: Table,
-    rows: Iterable[Dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     key_fields: Sequence[str],
     exclude_hash_fields: Optional[Iterable[str]],
     chunk_size: int,
     detect_deletions: bool,
     window: Optional[tuple] = None,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     now = datetime.now(timezone.utc)
     reg_date_field = window[0] if window else None
 
@@ -140,104 +128,43 @@ def _apply(
 def _load_staging(
     conn: Connection,
     staging: Table,
-    rows: Iterable[Dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     key_fields: Sequence[str],
     exclude_hash_fields: Optional[Iterable[str]],
     chunk_size: int,
     reg_date_field: Optional[str] = None,
 ) -> int:
-    """Producer/consumer split so the API fetch of the next chunk overlaps
-    with the database write of the current one, instead of the fetch
-    sitting idle for the duration of every write (which is seconds per
-    batch on BigQuery).
+    """Write `rows` into the staging table in chunks.
 
-    The PRODUCER thread consumes `rows` (the API fetch generator, which has
-    no thread affinity) and turns each record into a staged dict; full
-    chunks go on a small bounded queue. The CONSUMER is this function, on
-    the caller's own thread: it drains the queue and writes each chunk via
-    `adapter.insert_rows`. Threading it this way round -- fetch on the
-    helper thread, writes on the caller's thread -- is what keeps `conn`
-    on the single thread that created it, which SQLite hard-requires
-    (its DBAPI objects are thread-affine: using one from another thread
-    raises, confirmed live). The write-on-helper-thread arrangement would
-    need a per-dialect capability flag just to exist; this one is safe for
-    every dialect unconditionally.
-
-    Writes stay strictly one-at-a-time (each `insert_rows` finishes before
-    the next chunk is taken). That pace matters on BigQuery: it caps table
-    update operations (load jobs included) at a low fixed rate regardless
-    of whether earlier ones finished, so concurrent writes trip `429 too
-    many table update operations for this table` -- a hard platform limit
-    (measured live), not a raisable quota. Serial writes paced by each
-    job's own duration stay comfortably under it.
-
-    The bounded queue is the backpressure: if writes fall behind, the
-    producer blocks on `put` instead of buffering the whole backfill in
-    memory.
+    `buffered_chunks` fetches the next chunk on a helper thread while this
+    thread writes the current one. Writes have to stay on this thread:
+    `conn` must not leave the thread that created it (SQLite requires
+    this). They also stay serial on purpose: BigQuery caps table update
+    operations at a low fixed rate, and concurrent writes trip a hard 429
+    (see `dialects.BigQueryAdapter.insert_rows`).
     """
     adapter = get_adapter(conn.engine)
-    chunk_queue: "queue.Queue" = queue.Queue(maxsize=2)
-    _DONE = object()
-    consumer_failed = threading.Event()
+    chunk_size = adapter.staging_chunk_size(chunk_size)
 
-    def produce():
-        try:
-            chunk = []
-            for payload in rows:
-                staged = {
-                    "_natural_key": natural_key(payload, key_fields),
-                    "_row_hash": row_hash(payload, exclude_hash_fields),
-                    "payload": payload,
-                }
-                if reg_date_field:
-                    staged["_reg_date"] = datetime.strptime(payload[reg_date_field], "%Y-%m-%d").date()
-                chunk.append(staged)
-                if len(chunk) >= chunk_size:
-                    if not put(chunk):
-                        return  # consumer died; its exception is the real error
-                    chunk = []
-            if chunk:
-                put(chunk)
-            put(_DONE)
-        except Exception as exc:  # fetch failure: hand it to the consumer to re-raise
-            put(exc)
-
-    def put(item) -> bool:
-        """Blocks until queued, re-checking every second whether the
-        consumer died -- otherwise a full queue would hang the producer
-        forever instead of letting the consumer's error surface.
-        """
-        while not consumer_failed.is_set():
-            try:
-                chunk_queue.put(item, timeout=1)
-                return True
-            except queue.Full:
-                continue
-        return False
-
-    producer = threading.Thread(target=produce, daemon=True)
-    producer.start()
+    def stage(payload):
+        staged = {
+            "_natural_key": natural_key(payload, key_fields),
+            "_row_hash": row_hash(payload, exclude_hash_fields),
+            "payload": payload,
+        }
+        if reg_date_field:
+            staged["_reg_date"] = datetime.strptime(payload[reg_date_field], "%Y-%m-%d").date()
+        return staged
 
     fetched = 0
-    try:
-        while True:
-            item = chunk_queue.get()
-            if item is _DONE:
-                break
-            if isinstance(item, Exception):
-                raise item
-            adapter.insert_rows(conn, staging, item)
-            fetched += len(item)
-            # every ~50k rows: staging a multi-million-row backfill takes
-            # hours, so it can't be a silent gap between the per-chunk fetch
-            # logs and the final "fetch done" line.
-            if fetched % (chunk_size * 10) == 0:
-                logger.info("%s: %d rows staged so far", staging.name, fetched)
-    except BaseException:
-        consumer_failed.set()  # unblock the producer so it can exit
-        raise
-    finally:
-        producer.join()
+    for chunk in buffered_chunks(rows, chunk_size, transform=stage):
+        adapter.insert_rows(conn, staging, chunk)
+        fetched += len(chunk)
+        # Staging a multi-million-row backfill takes hours; log every
+        # ~10 chunks so there is no silent gap between the per-chunk
+        # fetch logs and the final "fetch done" line.
+        if fetched % (chunk_size * 10) == 0:
+            logger.info("%s: %d rows staged so far", staging.name, fetched)
     return fetched
 
 
@@ -263,7 +190,7 @@ def _missing_in_window(table: Table, staging: Table, window: tuple):
 
 def _diff_stats(
     conn: Connection, table: Table, staging: Table, detect_deletions: bool, window: Optional[tuple] = None
-) -> Dict[str, int]:
+) -> dict[str, int]:
     touched = conn.execute(
         select(func.count())
         .select_from(table)
@@ -282,8 +209,9 @@ def _diff_stats(
         )
     ).scalar_one()
 
+    # count distinct keys, matching the DISTINCT dedup in _insert_new_versions
     inserted = conn.execute(
-        select(func.count())
+        select(func.count(func.distinct(staging.c._natural_key)))
         .select_from(staging)
         .where(
             ~exists(
@@ -352,16 +280,23 @@ def _insert_new_versions(conn: Connection, table: Table, staging: Table, now: da
     no_current_match = ~exists(
         select(1).where(_matches(table, staging), table.c._is_current.is_(True))
     )
-    select_new_versions = select(
-        staging.c._natural_key,
-        staging.c._row_hash,
-        literal(now),
-        literal(None, type_=table.c._valid_to.type),
-        literal(True),
-        literal(now),
-        staging.c._reg_date,
-        staging.c.payload,
-    ).where(no_current_match)
+    # DISTINCT: if the same record was fetched twice into staging (e.g. a
+    # stray concurrent writer), collapse the identical copies instead of
+    # inserting two current versions of the same natural key.
+    select_new_versions = (
+        select(
+            staging.c._natural_key,
+            staging.c._row_hash,
+            literal(now),
+            literal(None, type_=table.c._valid_to.type),
+            literal(True),
+            literal(now),
+            staging.c._reg_date,
+            staging.c.payload,
+        )
+        .where(no_current_match)
+        .distinct()
+    )
 
     conn.execute(
         insert(table).from_select(

@@ -7,10 +7,12 @@ same way the real upstream data changes between cron runs: a field edited,
 a row withdrawn, a new row registered.
 """
 
+from collections.abc import Sequence
 from copy import deepcopy
-from typing import Any, Dict, Sequence
+from typing import Any
 
 from sqlalchemy import MetaData, desc, select
+
 from bdns.sync.sinks.sql.schema import build_control_tables, build_sync_table
 
 
@@ -22,10 +24,11 @@ def current_rows(engine, name):
 
 
 def last_sync_run(engine, table_name):
-    """Most recent `_sync_runs` row for `table_name`. This is the durable
-    record of what a run did (rows fetched, inserted, soft-deleted, skipped),
-    independent of the transient stats dict the sync_* function happens to
-    return.
+    """Latest EVENT of the most recent `_sync_runs` run for `table_name`
+    (the run log is append-only: started + terminal success/failed events;
+    a run's state is its latest event). This is the durable record of what
+    a run did (rows fetched, inserted, soft-deleted, skipped), independent
+    of the transient stats dict the sync_* function happens to return.
     """
     metadata = MetaData()
     _, sync_runs, _ = build_control_tables(metadata)
@@ -33,7 +36,7 @@ def last_sync_run(engine, table_name):
         return conn.execute(
             select(sync_runs)
             .where(sync_runs.c.table_name == table_name)
-            .order_by(desc(sync_runs.c.run_id))
+            .order_by(desc(sync_runs.c.run_id), desc(sync_runs.c.occurred_at))
             .limit(1)
         ).mappings().one()
 
@@ -60,7 +63,7 @@ def all_rows(engine, name):
         return conn.execute(select(table)).mappings().all()
 
 
-def fresh_copy_with_new_key(row: Dict[str, Any], key_fields: Sequence[str]) -> Dict[str, Any]:
+def fresh_copy_with_new_key(row: dict[str, Any], key_fields: Sequence[str]) -> dict[str, Any]:
     """Deep-copy `row` and perturb its key field(s) so it reads as a brand
     new natural key. Used to simulate a newly-registered record appearing.
     """

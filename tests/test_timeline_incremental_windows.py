@@ -33,8 +33,8 @@ import pytest
 from sqlalchemy import create_engine
 
 from bdns.sync.generic import CHUNK_DAYS, WINDOWS
-from bdns.sync.syncers import SEARCH_SYNCERS
 from bdns.sync.sinks.sql import SQLSink
+from bdns.sync.syncers import SEARCH_SYNCERS
 from tests.fake_client import FakeBDNSClient
 from tests.timeline_helpers import current_rows
 
@@ -311,4 +311,6 @@ def test_backfill_since_until_range_fetches_the_whole_span(endpoint, key_fields)
 
 
 def test_search_syncers_registry_covers_every_incremental_entity():
-    assert set(SEARCH_SYNCERS) == {name for name, _ in INCREMENTAL_CASES}
+    # convocatorias (two-step discover-then-detail, covered by its own
+    # timeline test file) shares the registry with the plain search entities.
+    assert set(SEARCH_SYNCERS) == {name for name, _ in INCREMENTAL_CASES} | {"convocatorias"}
